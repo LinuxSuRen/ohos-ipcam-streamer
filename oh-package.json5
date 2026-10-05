@@ -1,0 +1,10 @@
+{
+  "modelVersion": "6.0.0",
+  "name": "ohos-ipcam-streamer",
+  "version": "0.1.0",
+  "description": "HarmonyOS phone camera to IP camera gateway (RTSP + ONVIF)",
+  "main": "",
+  "author": "linuxsuren",
+  "license": "MIT",
+  "dependencies": {}
+}

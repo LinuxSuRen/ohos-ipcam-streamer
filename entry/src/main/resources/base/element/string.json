@@ -1,0 +1,20 @@
+{
+  "string": [
+    {
+      "name": "module_desc",
+      "value": "phone camera RTSP/ONVIF streamer"
+    },
+    {
+      "name": "ability_desc",
+      "value": "main ability"
+    },
+    {
+      "name": "Index_desc",
+      "value": "IP camera control page"
+    },
+    {
+      "name": "camera_perm_reason",
+      "value": "capture camera frames and stream them over the network"
+    }
+  ]
+}

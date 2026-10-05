@@ -1,0 +1,6 @@
+{
+  "name": "libh264enc.so",
+  "types": "./index.d.ts",
+  "version": "1.0.0",
+  "description": "H.264 surface encoder napi shim"
+}

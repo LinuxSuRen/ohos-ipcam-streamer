@@ -1,0 +1,11 @@
+{
+  "name": "entry",
+  "version": "1.0.0",
+  "description": "phone camera to RTSP/ONVIF IP camera",
+  "main": "",
+  "author": "linuxsuren",
+  "license": "MIT",
+  "dependencies": {
+    "libh264enc.so": "file:./src/main/cpp/types/libh264enc"
+  }
+}
