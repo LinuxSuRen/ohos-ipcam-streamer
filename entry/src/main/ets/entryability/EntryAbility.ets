@@ -5,6 +5,7 @@ import window from '@ohos.window';
 import hilog from '@ohos.hilog';
 import { abilityAccessCtrl, Permissions } from '@kit.AbilityKit';
 import { setAbilityContext, setCameraGranted, initPersisted } from './GlobalContext';
+import { CrashGuard } from './CrashGuard';
 
 const DOMAIN = 0x0801;
 const TAG = 'ipcam.EntryAbility';
@@ -12,6 +13,7 @@ const TAG = 'ipcam.EntryAbility';
 export default class EntryAbility extends UIAbility {
   onCreate(want: Want, launchParam: AbilityConstant.LaunchParam): void {
     hilog.info(DOMAIN, TAG, 'onCreate');
+    CrashGuard.install(this.context);
     try {
       const p = want.parameters as Record<string, Object>;
       const rot = p !== undefined && p.rotate !== undefined ? parseInt(String(p.rotate)) : -1;

@@ -18,3 +18,5 @@
 **/.cxx/
 **/oh_modules/
 **/.hvigor/
+
+.DS_Store
