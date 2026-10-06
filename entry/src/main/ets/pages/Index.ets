@@ -1,25 +1,30 @@
-import { CameraSource, ActiveProfile, CameraOption } from '../camera/CameraSource';
+import { CameraSource, CamPipeline } from '../camera/CameraSource';
 import { OrientationSensor } from '../camera/OrientationSensor';
 import { H264Encoder } from '../codec/H264Encoder';
 import { FrameHub, FrameSink } from '../net/FrameHub';
+import { CamRegistry, CamInfo } from '../net/CamRegistry';
+import { JpegSource } from '../net/JpegSource';
+import { HttpServer } from '../http/HttpServer';
 import { RtspServer } from '../rtsp/RtspServer';
 import { OnvifServer } from '../onvif/OnvifServer';
 import { BackgroundKeeper } from '../background/BackgroundKeeper';
+import { CrashGuard } from '../entryability/CrashGuard';
 import { getAbilityContext, isCameraGranted } from '../entryability/GlobalContext';
 import { loadSettings, saveSettings } from '../entryability/PersistStore';
 import { refreshLanAddress } from '../net/NetUtil';
 import hilog from '@ohos.hilog';
-
 const DOMAIN = 0x0805;
 const TAG = 'ipcam.Index';
 const WANT_WIDTH = 1280;
 const WANT_HEIGHT = 720;
 const WANT_FPS = 25;
-const WANT_BITRATE = 2000000;
+/* 720x1280@30 实测:CBR 2Mbps 时编码器色度被量化清零(画面大面积绿块),
+ * 提到 4Mbps 恢复正常;兼顾画质与 WiFi 带宽取 4Mbps。 */
+const WANT_BITRATE = 4000000;
 
 class RtspSink implements FrameSink {
-  onFrame(f: ArrayBuffer, k: boolean): void {
-    RtspServer.broadcast(f, k);
+  onFrame(f: ArrayBuffer, k: boolean, cam: number): void {
+    RtspServer.broadcast(f, k, cam);
   }
 }
 
@@ -48,63 +53,30 @@ struct Index {
   @State stats: string = '';
   @State profileText: string = '';
   @State rtspUrl: string = '';
-  @State onvifUrl: string = '';
-  @State cameras: CameraOption[] = [];
+  @State httpUrl: string = '';
   @State suggestDeg: number = -1;
+  @State crashText: string = '';
   private timerId: number = -1;
   private curRotate: number = 0;
-  private curCam: number = -1;
+  private camInfos: CamInfo[] = [];
+  private lastFrames: number[] = [0, 0, 0, 0];
+  private lastAdvanceAt: number[] = [0, 0, 0, 0];
 
   aboutToAppear(): void {
     const st = loadSettings(getAbilityContext()!);
     this.curRotate = st.rotate;
-    this.curCam = st.cam;
-    this.cameras = CameraSource.getDevices(getAbilityContext()!);
+    const crash = CrashGuard.consume(getAbilityContext()!);
+    if (crash !== null) {
+      this.crashText = crash.split('\n').slice(0, 2).join('\n');
+      hilog.warn(DOMAIN, TAG, 'last crash: %{public}s', this.crashText);
+    }
     OrientationSensor.start((deg: number) => {
       this.suggestDeg = deg;
     });
-    /* 切换后的重开:自动恢复推流 */
+    /* 切换方向后的重开:自动恢复推流 */
     if (st.autoStart && isCameraGranted()) {
       hilog.info(DOMAIN, TAG, 'auto resume streaming');
       this.doStart();
-    }
-  }
-
-  /** 当前 rotate 下的输出宽高(90/270 交换)。 */
-  private outSize(): number[] {
-    if (this.curRotate === 90 || this.curRotate === 270) {
-      return [WANT_HEIGHT, WANT_WIDTH];
-    }
-    return [WANT_WIDTH, WANT_HEIGHT];
-  }
-
-  private async restartIfNeeded(): Promise<void> {
-    if (!this.running) {
-      return;
-    }
-    await this.doStop();
-    await new Promise<void>((res) => {
-      setTimeout(() => {
-        res();
-      }, 800); /* 相机 HAL 释放时序 */
-    });
-    await this.doStart();
-  }
-
-  private async switchCamera(idx: number): Promise<void> {
-    if (!this.running || idx === this.curCam) {
-      return;
-    }
-    try {
-      saveSettings(getAbilityContext()!, {
-        rotate: this.curRotate,
-        cam: idx,
-        autoStart: true
-      });
-      await getAbilityContext()!.terminateSelf();
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : JSON.stringify(e);
-      this.status = `切换失败: ${msg}`;
     }
   }
 
@@ -120,7 +92,7 @@ struct Index {
     try {
       saveSettings(getAbilityContext()!, {
         rotate: deg,
-        cam: this.curCam,
+        cam: -1,
         autoStart: true
       });
       await getAbilityContext()!.terminateSelf();
@@ -141,40 +113,80 @@ struct Index {
     try {
       await refreshLanAddress();
       H264Encoder.setListener((f) => {
-        FrameHub.publish(f.data, f.keyframe);
+        FrameHub.publish(f.data, f.keyframe, f.cam);
       });
       FrameHub.addSink(rtspSink);
       FrameHub.reset();
+      JpegSource.reset();
+      CameraSource.setRotate(this.curRotate);
 
-      const out: number[] = this.outSize();
-      this.status = '启动采集面';
-      const surfaceId = H264Encoder.createCaptureSurface(WANT_WIDTH, WANT_HEIGHT, this.curRotate);
-      this.status = `启动编码器 ${out[0]}x${out[1]}(${this.curRotate}°)`;
-      H264Encoder.startEncoder(out[0], out[1], WANT_FPS, WANT_BITRATE);
+      /* 阶段一:全部相机创建采集面并选定 profile(不打开相机) */
+      this.status = '准备摄像头';
+      this.lastFrames = [0, 0, 0, 0];
+      this.lastAdvanceAt = [0, 0, 0, 0];
+      const pipelines: CamPipeline[] = CameraSource.prepare(
+        getAbilityContext()!, this.curRotate, WANT_WIDTH, WANT_HEIGHT);
+      if (pipelines.length === 0) {
+        throw new Error('no camera available');
+      }
 
-      this.status = '启动 RTSP / ONVIF';
+      /* 服务器先行:拉流端可立即连接 */
+      this.status = '启动 RTSP / ONVIF / HTTP';
       await RtspServer.start(WANT_FPS);
-      await OnvifServer.start();
+      await OnvifServer.start(getAbilityContext()!);
+      await HttpServer.start();
 
+      /* 阶段二:全部编码器实例常驻启动,再尽量并发打开全部相机 */
+      this.status = '启动编码器';
+      const encPipelines = CameraSource.startEncoders(WANT_FPS, WANT_BITRATE);
+      if (encPipelines.length === 0) {
+        throw new Error('no encoder started');
+      }
       this.status = '启动相机';
-      const p: ActiveProfile = await CameraSource.start(getAbilityContext()!, surfaceId,
-        WANT_WIDTH, WANT_HEIGHT, this.curCam);
-      this.profileText = `${out[0]}x${out[1]}(${this.curRotate}°)`;
+      const started: number[] = await CameraSource.openAll(getAbilityContext()!);
+
+      this.camInfos = [];
+      for (const idx of started) {
+        const p = encPipelines.find((c) => c.index === idx);
+        if (p !== undefined) {
+          const info: CamInfo = {
+            index: p.index, label: p.label, outW: p.outW, outH: p.outH,
+            fps: WANT_FPS, bitrate: WANT_BITRATE
+          };
+          this.camInfos.push(info);
+        }
+      }
+      CamRegistry.set(this.camInfos);
+      this.profileText = this.camInfos.map((c) => `${c.label} ${c.outW}x${c.outH}`).join(' / ');
 
       await BackgroundKeeper.start(getAbilityContext()!);
 
       const ip = await refreshLanAddress();
-      this.rtspUrl = ip !== '' ? `rtsp://${ip}:8554/cam` : 'rtsp://<本机IP>:8554/cam';
-      this.onvifUrl = ip !== '' ? `http://${ip}:8000/onvif/device_service` : '';
+      this.rtspUrl = ip !== '' ? `rtsp://${ip}:8554/cam0 … cam${this.camInfos.length - 1}` : 'rtsp://<本机IP>:8554/camN';
+      this.httpUrl = ip !== '' ? `http://${ip}:8090/ (快照/网页)` : '';
       this.running = true;
       this.status = '推流中';
       saveSettings(getAbilityContext()!, {
         rotate: this.curRotate,
-        cam: this.curCam,
+        cam: -1,
         autoStart: false
       });
       this.timerId = setInterval(() => {
-        this.stats = `${FrameHub.stats()} 客户端=${RtspServer.sessionCount()}`;
+        const parts = this.camInfos.map((c) => `${c.label}=${FrameHub.fps(c.index)}fps`);
+        this.stats = `${parts.join(' ')} RTSP客户端=${RtspServer.sessionCount()}`;
+        /* 帧停滞自愈:任一在推相机 6 秒无新帧(熄屏唤醒/HAL 卡死)则重开会话 */
+        const now = Date.now();
+        for (const c of this.camInfos) {
+          const fc = FrameHub.frameCount(c.index);
+          if (fc > this.lastFrames[c.index]) {
+            this.lastFrames[c.index] = fc;
+            this.lastAdvanceAt[c.index] = now;
+          } else if (now - this.lastAdvanceAt[c.index] > 6000 && this.lastAdvanceAt[c.index] > 0) {
+            this.lastAdvanceAt[c.index] = now;
+            hilog.warn(DOMAIN, TAG, 'cam%{public}d frame stall, reopening', c.index);
+            CameraSource.reopen(getAbilityContext()!, c.index);
+          }
+        }
       }, 1000);
     } catch (e) {
       const msg = e instanceof Error ? e.message : JSON.stringify(e);
@@ -194,12 +206,12 @@ struct Index {
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'camera stop');
     }
-    H264Encoder.stopEncoder();
-    H264Encoder.destroyCaptureSurface();
     FrameHub.removeSink(rtspSink);
     FrameHub.endDump();
+    JpegSource.reset();
     await RtspServer.stop();
     await OnvifServer.stop();
+    await HttpServer.stop();
     await BackgroundKeeper.stop(getAbilityContext()!);
   }
 
@@ -226,10 +238,16 @@ struct Index {
           Text(`输出: ${this.profileText}`).fontSize(14).fontColor('#E6E6E6')
         }
         if (this.stats !== '') {
-          Text(this.stats).fontSize(14).fontColor('#E6E6E6')
+          Text(this.stats).fontSize(13).fontColor('#E6E6E6')
         }
         if (this.rtspUrl !== '') {
           Text(this.rtspUrl).fontSize(13).fontColor('#7EB8FF')
+        }
+        if (this.httpUrl !== '') {
+          Text(this.httpUrl).fontSize(13).fontColor('#7EB8FF')
+        }
+        if (this.crashText !== '') {
+          Text(`上次异常:\n${this.crashText}`).fontSize(12).fontColor('#FF6B6B')
         }
         if (this.running && this.suggestDeg >= 0 && this.suggestDeg !== this.curRotate) {
           Text(`检测到手机${rotateLabel(this.suggestDeg)},建议点「${rotateLabel(this.suggestDeg)}」切换`)
@@ -254,18 +272,6 @@ struct Index {
                 this.switchRotate(deg);
               })
           }, (deg: number) => deg.toString())
-          ForEach(this.cameras, (c: CameraOption) => {
-            Text(c.label)
-              .fontSize(13)
-              .fontColor(this.curCam === c.index ? '#0B1220' : '#9FD8A0')
-              .backgroundColor(this.curCam === c.index ? '#9FD8A0' : '#1A2940')
-              .borderRadius(14)
-              .padding({ left: 12, right: 12, top: 6, bottom: 6 })
-              .margin(4)
-              .onClick(() => {
-                this.switchCamera(c.index);
-              })
-          }, (c: CameraOption) => c.index.toString())
         }
         .width('100%')
       }
@@ -283,8 +289,9 @@ struct Index {
 
       Column({ space: 4 }) {
         Text('同一局域网内可接入:').fontSize(13).fontColor('#AAAAAA')
-        Text('VLC / ffmpeg: rtsp://手机IP:8554/cam').fontSize(12).fontColor('#888888')
-        Text('NVR / Frigate: 通过 ONVIF 自动发现添加').fontSize(12).fontColor('#888888')
+        Text('VLC / ffmpeg: rtsp://手机IP:8554/camN(每颗摄像头一路)').fontSize(12).fontColor('#888888')
+        Text('NVR / Frigate: 通过 ONVIF 自动发现添加(多 Profile)').fontSize(12).fontColor('#888888')
+        Text('浏览器: http://手机IP:8090/ 快照与 MJPEG').fontSize(12).fontColor('#888888')
         Text('熄屏与后台运行可持续推流(常驻通知)').fontSize(12).fontColor('#888888')
       }
       .alignItems(HorizontalAlign.Start)

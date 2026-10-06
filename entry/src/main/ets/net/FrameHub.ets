@@ -5,21 +5,45 @@ import { splitAnnexB } from '../rtsp/RtpPacketizer';
 
 const DOMAIN = 0x0804;
 const TAG = 'ipcam.FrameHub';
+const MAX_CAMS = 4;
 
 export interface FrameSink {
-  onFrame(frame: ArrayBuffer, keyframe: boolean): void;
+  onFrame(frame: ArrayBuffer, keyframe: boolean, cam: number): void;
 }
 
 let fd: number = -1;
-let frames = 0;
-let keyframes = 0;
-let bytes = 0;
-let spsRaw: Uint8Array | null = null;
-let ppsRaw: Uint8Array | null = null;
 let sinks: FrameSink[] = [];
 
+/* 按相机分路的统计与参数集 */
+interface CamStats {
+  frames: number;
+  keyframes: number;
+  bytes: number;
+  sps: Uint8Array | null;
+  pps: Uint8Array | null;
+  fpsCalcAt: number;
+  fpsCalcFrames: number;
+  fpsVal: number;
+}
+
+function newStats(): CamStats {
+  return {
+    frames: 0, keyframes: 0, bytes: 0, sps: null, pps: null,
+    fpsCalcAt: 0, fpsCalcFrames: 0, fpsVal: 0
+  };
+}
+
+let camStats: CamStats[] = [newStats(), newStats(), newStats(), newStats()];
+
+function st(cam: number): CamStats {
+  if (cam < 0 || cam >= MAX_CAMS) {
+    return camStats[0];
+  }
+  return camStats[cam];
+}
+
 /**
- * 编码帧汇合点:dump(调试)+ 多 sink 分发(RTSP/后续消费者)。
+ * 编码帧汇合点:dump(调试)+ 按 cam 分路分发(RTSP/HTTP 等消费者)。
  */
 export class FrameHub {
   static addSink(s: FrameSink): void {
@@ -57,8 +81,8 @@ export class FrameHub {
     }
   }
 
-  static publish(frame: ArrayBuffer, keyframe: boolean): void {
-    FrameHub.captureParameterSets(frame);
+  static publish(frame: ArrayBuffer, keyframe: boolean, cam: number): void {
+    FrameHub.captureParameterSets(frame, cam);
     if (fd >= 0) {
       try {
         fs.writeSync(fd, frame);
@@ -67,49 +91,68 @@ export class FrameHub {
       }
     }
     for (const s of sinks) {
-      s.onFrame(frame, keyframe);
+      s.onFrame(frame, keyframe, cam);
     }
-    frames++;
-    bytes += frame.byteLength;
+    const c = st(cam);
+    c.frames++;
+    c.bytes += frame.byteLength;
     if (keyframe) {
-      keyframes++;
+      c.keyframes++;
     }
   }
 
-  /** 拆出裸 SPS(7)/PPS(8) NALU,喂给 RTSP 的 sprop-parameter-sets。 */
-  static captureParameterSets(frame: ArrayBuffer): void {
-    if (spsRaw !== null && ppsRaw !== null) {
+  /** 拆出裸 SPS(7)/PPS(8) NALU,喂给对应相机 RTSP 的 sprop-parameter-sets。 */
+  static captureParameterSets(frame: ArrayBuffer, cam: number): void {
+    const c = st(cam);
+    if (c.sps !== null && c.pps !== null) {
       return;
     }
     try {
       const nalus = splitAnnexB(new Uint8Array(frame));
       for (const nalu of nalus) {
         const type = nalu[0] & 0x1f;
-        if (type === 7 && spsRaw === null) {
-          spsRaw = nalu;
-          hilog.info(DOMAIN, TAG, 'SPS captured, %{public}d bytes', nalu.length);
-        } else if (type === 8 && ppsRaw === null) {
-          ppsRaw = nalu;
-          hilog.info(DOMAIN, TAG, 'PPS captured, %{public}d bytes', nalu.length);
+        if (type === 7 && c.sps === null) {
+          c.sps = nalu;
+        } else if (type === 8 && c.pps === null) {
+          c.pps = nalu;
         }
       }
-      setParameterSets(spsRaw, ppsRaw);
+      setParameterSets(cam, c.sps, c.pps);
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'split ps failed');
     }
   }
 
-  static stats(): string {
-    const kb = Math.round(bytes / 1024);
-    return `frames=${frames} keyframes=${keyframes} size=${kb}KB`;
+  static stats(cam: number): string {
+    const c = st(cam);
+    const kb = Math.round(c.bytes / 1024);
+    return `frames=${c.frames} keyframes=${c.keyframes} size=${kb}KB`;
+  }
+
+  static frameCount(cam: number): number {
+    return st(cam).frames;
+  }
+
+  /** 差分法估算指定相机的编码帧率(秒级调用)。 */
+  static fps(cam: number): number {
+    const c = st(cam);
+    const now = Date.now();
+    if (c.fpsCalcAt > 0 && now > c.fpsCalcAt) {
+      const f = Math.round((c.frames - c.fpsCalcFrames) * 1000 / (now - c.fpsCalcAt));
+      c.fpsCalcAt = now;
+      c.fpsCalcFrames = c.frames;
+      if (f >= 0) {
+        c.fpsVal = f;
+      }
+    } else {
+      c.fpsCalcAt = now;
+      c.fpsCalcFrames = c.frames;
+    }
+    return c.fpsVal;
   }
 
   static reset(): void {
-    frames = 0;
-    keyframes = 0;
-    bytes = 0;
-    spsRaw = null;
-    ppsRaw = null;
+    camStats = [newStats(), newStats(), newStats(), newStats()];
     resetParameterSets();
   }
 }

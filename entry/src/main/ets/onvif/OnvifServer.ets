@@ -1,7 +1,12 @@
 import socket from '@ohos.net.socket';
 import { BusinessError } from '@ohos.base';
 import hilog from '@ohos.hilog';
+import common from '@ohos.app.ability.common';
+import util from '@ohos.util';
 import { lanAddress } from '../net/NetUtil';
+import { CamRegistry } from '../net/CamRegistry';
+import { HttpServer } from '../http/HttpServer';
+import { deviceModel, deviceOs, deviceLabel, deviceHardware, ensureDeviceId } from '../entryability/DeviceIdentity';
 
 const DOMAIN = 0x0809;
 const TAG = 'ipcam.OnvifServer';
@@ -29,6 +34,12 @@ function str2ab(s: string): ArrayBuffer {
   return u8.buffer;
 }
 
+/** XML 必须按 UTF-8 编码:中相机名经 str2ab 的 Latin-1 截断会变乱码。 */
+function utf8(s: string): ArrayBuffer {
+  const encoder = new util.TextEncoder();
+  return encoder.encodeInto(s).buffer as ArrayBuffer;
+}
+
 function xmlEscape(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
@@ -49,11 +60,17 @@ export class OnvifServer {
   private static httpServer: socket.TCPSocketServer | null = null;
   private static discovery: socket.MulticastSocket | null = null;
   private static running = false;
+  private static deviceId: string = '';
+  private static instanceId = 0;
+  private static msgNo = 0;
 
-  static async start(): Promise<void> {
+  static async start(context: common.Context): Promise<void> {
     if (OnvifServer.running) {
       return;
     }
+    OnvifServer.deviceId = ensureDeviceId(context);
+    OnvifServer.instanceId = Math.floor(Date.now() / 1000);
+    OnvifServer.msgNo = 0;
     await OnvifServer.startHttp();
     OnvifServer.startDiscovery();
     OnvifServer.running = true;
@@ -70,6 +87,17 @@ export class OnvifServer {
       OnvifServer.httpServer = null;
     }
     if (OnvifServer.discovery !== null) {
+      /* 停止前发 Bye,通知发现客户端本设备下线 */
+      try {
+        const bye = OnvifServer.discoveryMessage('Bye', '');
+        const sendOpt: socket.UDPSendOptions = {
+          data: utf8(bye),
+          address: { address: DISCOVERY_GROUP, port: DISCOVERY_PORT }
+        };
+        await OnvifServer.discovery.send(sendOpt);
+      } catch (e) {
+        hilog.warn(DOMAIN, TAG, 'send bye failed');
+      }
       try {
         const dropOpt: socket.NetAddress = { address: DISCOVERY_GROUP, port: 0 };
         await OnvifServer.discovery.dropMembership(dropOpt);
@@ -104,7 +132,7 @@ export class OnvifServer {
         if (contentLength >= 0 && buf.length >= contentLength) {
           const body = buf.substring(0, contentLength);
           const response = OnvifServer.handleSoap(body);
-          const sendOpt: socket.TCPSendOptions = { data: str2ab(response) };
+          const sendOpt: socket.TCPSendOptions = { data: utf8(response) };
           client.send(sendOpt).then(() => {
             client.close();
           }).catch(() => {
@@ -152,6 +180,14 @@ export class OnvifServer {
         const memberOpt: socket.NetAddress = { address: DISCOVERY_GROUP, port: DISCOVERY_PORT };
         ms.addMembership(memberOpt).then(() => {
           hilog.info(DOMAIN, TAG, 'ws-discovery joined %{public}s', DISCOVERY_GROUP);
+          /* 入组后主动发 Hello:在线客户端无需 Probe 即可感知本设备 */
+          const hello = OnvifServer.discoveryMessage('Hello', '');
+          const helloOpt: socket.UDPSendOptions = {
+            data: utf8(hello),
+            address: { address: DISCOVERY_GROUP, port: DISCOVERY_PORT }
+          };
+          ms.send(helloOpt).catch(() => {
+          });
         }).catch((e: BusinessError) => {
           hilog.warn(DOMAIN, TAG, 'join group failed: %{public}s', JSON.stringify(e));
         });
@@ -162,27 +198,44 @@ export class OnvifServer {
     }
   }
 
-  private static probeMatches(relatesTo: string): string {
+  /** 发现消息通用模板:ProbeMatches(应答)/Hello(上线)/Bye(下线)。 */
+  private static discoveryMessage(action: string, relatesTo: string): string {
     const ip = lanAddress();
     const now = Date.now();
+    const inner = action === 'ProbeMatches' ? 'ProbeMatch' : action;
+    const relates = relatesTo !== '' ? `<a:RelatesTo>${xmlEscape(relatesTo)}</a:RelatesTo>` : '';
+    OnvifServer.msgNo++;
     return '<?xml version="1.0" encoding="UTF-8"?>' +
-      '<e:Envelope xmlns:e="http://www.w3.org/2003/05/soap-envelope" ' +
+      '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" ' +
       'xmlns:a="http://schemas.xmlsoap.org/ws/2004/08/addressing" ' +
       'xmlns:d="http://schemas.xmlsoap.org/ws/2005/04/discovery" ' +
       'xmlns:dn="http://www.onvif.org/ver10/network/wsdl">' +
-      '<e:Header>' +
+      '<s:Header>' +
       `<a:MessageID>urn:uuid:${now}</a:MessageID>` +
-      '<a:RelatesTo>' + xmlEscape(relatesTo) + '</a:RelatesTo>' +
+      relates +
       '<a:To>http://schemas.xmlsoap.org/ws/2004/08/addressing/role/anonymous</a:To>' +
-      '<a:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/ProbeMatches</a:Action>' +
-      '</e:Header><e:Body>' +
-      '<d:ProbeMatches>' +
-      `<d:ProbeMatch><a:EndpointReference><a:Address>${DEVICE_UUID}</a:Address></a:EndpointReference>` +
-      `<d:Types>dn:NetworkVideoTransmitter</d:Types>` +
-      `<d:Scopes>onvif://www.onvif.org/Profile/Streaming</d:Scopes>` +
+      `<a:Action>http://schemas.xmlsoap.org/ws/2005/04/discovery/${action}</a:Action>` +
+      `<d:AppSequence InstanceId="${OnvifServer.instanceId}" MessageNumber="${OnvifServer.msgNo}"/>` +
+      '</s:Header><s:Body>' +
+      `<d:${action}><d:${inner}>` +
+      `<a:EndpointReference><a:Address>${DEVICE_UUID}</a:Address></a:EndpointReference>` +
+      '<d:Types>dn:NetworkVideoTransmitter</d:Types>' +
+      `<d:Scopes>${OnvifServer.scopes()}</d:Scopes>` +
       `<d:XAddrs>http://${ip}:${HTTP_PORT}/onvif/device_service</d:XAddrs>` +
-      `<d:MetadataVersion>1</d:MetadataVersion></d:ProbeMatch>` +
-      '</d:ProbeMatches></e:Body></e:Envelope>';
+      '<d:MetadataVersion>1</d:MetadataVersion>' +
+      `</d:${inner}></d:${action}></s:Body></s:Envelope>`;
+  }
+
+  /** 发现 Scopes:类型/名称/硬件/Profile,名称带宿主机型便于多设备区分。 */
+  private static scopes(): string {
+    return 'onvif://www.onvif.org/type/NetworkVideoTransmitter' +
+      ` onvif://www.onvif.org/name/ohos-ipcam-streamer@${deviceLabel()}` +
+      ` onvif://www.onvif.org/hardware/${deviceLabel()}` +
+      ' onvif://www.onvif.org/Profile/Streaming';
+  }
+
+  private static probeMatches(relatesTo: string): string {
+    return OnvifServer.discoveryMessage('ProbeMatches', relatesTo);
   }
 
   private static handleSoap(body: string): string {
@@ -198,40 +251,82 @@ export class OnvifServer {
         `<tdt:Hour>${d.getUTCHours()}</tdt:Hour><tdt:Minute>${d.getUTCMinutes()}</tdt:Minute>` +
         `<tdt:Second>${d.getUTCSeconds()}</tdt:Second></tds:UTCDateTime>` +
         '</tds:SystemDateTime></tds:GetSystemDateAndTimeResponse>';
+    } else if (body.indexOf('GetCapabilities') >= 0) {
+      inner = '<tds:GetCapabilitiesResponse><tds:Capabilities>' +
+        `<tt:Device><tt:XAddr>http://${ip}:${HTTP_PORT}/onvif/device_service</tt:XAddr></tt:Device>` +
+        `<tt:Media><tt:XAddr>http://${ip}:${HTTP_PORT}/onvif/media_service</tt:XAddr>` +
+        '<tt:StreamingCapabilities>' +
+        '<tt:RTPMulticast>false</tt:RTPMulticast>' +
+        '<tt:RTP_TCP>true</tt:RTP_TCP>' +
+        '<tt:RTP_RTSP_TCP>true</tt:RTP_RTSP_TCP>' +
+        '<tt:NonAggregateControl>true</tt:NonAggregateControl>' +
+        '</tt:StreamingCapabilities></tt:Media>' +
+        '</tds:Capabilities></tds:GetCapabilitiesResponse>';
+    } else if (body.indexOf('GetServices') >= 0) {
+      inner = '<tds:GetServicesResponse>' +
+        '<tds:Service><tds:Namespace>http://www.onvif.org/ver10/device/wsdl</tds:Namespace>' +
+        `<tds:XAddr>http://${ip}:${HTTP_PORT}/onvif/device_service</tds:XAddr>` +
+        '<tds:Version><tt:Major>1</tt:Major><tt:Minor>0</tt:Minor></tds:Version></tds:Service>' +
+        '<tds:Service><tds:Namespace>http://www.onvif.org/ver10/media/wsdl</tds:Namespace>' +
+        `<tds:XAddr>http://${ip}:${HTTP_PORT}/onvif/media_service</tds:XAddr>` +
+        '<tds:Version><tt:Major>1</tt:Major><tt:Minor>0</tt:Minor></tds:Version></tds:Service>' +
+        '</tds:GetServicesResponse>';
     } else if (body.indexOf('GetProfiles') >= 0) {
-      inner = '<trt:GetProfilesResponse>' +
-        '<trt:Profiles fixed="true" token="profile_1">' +
-        '<tt:Name>main</tt:Name>' +
-        '<tt:VideoSourceConfiguration token="vsc_1">' +
-        '<tt:Name>vsc</tt:Name><tt:SourceToken>src_1</tt:SourceToken>' +
-        '<tt:Bounds x="0" y="0" width="1280" height="720"></tt:Bounds>' +
-        '</tt:VideoSourceConfiguration>' +
-        '<tt:VideoEncoderConfiguration token="vec_1">' +
-        '<tt:Name>h264</tt:Name>' +
-        '<tt:Encoding>H264</tt:Encoding>' +
-        '<tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution>' +
-        '<tt:RateControl><tt:FrameRateLimit>25</tt:FrameRateLimit>' +
-        '<tt:BitrateLimit>2000</tt:BitrateLimit></tt:RateControl>' +
-        '</tt:VideoEncoderConfiguration>' +
-        '</trt:Profiles></trt:GetProfilesResponse>';
+      /* 多摄像头:每路一个 Profile(token=profile_{N+1},N 为全局相机编号),
+       * 尺寸/帧率/码率与该路实际输出一致 */
+      let profiles = '';
+      for (const c of CamRegistry.list()) {
+        const n = c.index + 1;
+        const kbps = Math.round(c.bitrate / 1000);
+        profiles += `<trt:Profiles fixed="true" token="profile_${n}">` +
+          `<tt:Name>${xmlEscape(c.label)}</tt:Name>` +
+          `<tt:VideoSourceConfiguration token="vsc_${n}">` +
+          `<tt:Name>vsc_${n}</tt:Name><tt:SourceToken>src_${n}</tt:SourceToken>` +
+          `<tt:Bounds x="0" y="0" width="${c.outW}" height="${c.outH}"></tt:Bounds>` +
+          `</tt:VideoSourceConfiguration>` +
+          `<tt:VideoEncoderConfiguration token="vec_${n}">` +
+          `<tt:Name>h264_${n}</tt:Name>` +
+          '<tt:UseCount>1</tt:UseCount>' +
+          '<tt:Encoding>H264</tt:Encoding>' +
+          `<tt:Resolution><tt:Width>${c.outW}</tt:Width><tt:Height>${c.outH}</tt:Height></tt:Resolution>` +
+          '<tt:Quality>4</tt:Quality>' +
+          `<tt:RateControl><tt:FrameRateLimit>${c.fps}</tt:FrameRateLimit>` +
+          `<tt:BitrateLimit>${kbps}</tt:BitrateLimit></tt:RateControl>` +
+          '</tt:VideoEncoderConfiguration>' +
+          '</trt:Profiles>';
+      }
+      inner = `<trt:GetProfilesResponse>${profiles}</trt:GetProfilesResponse>`;
     } else if (body.indexOf('GetStreamUri') >= 0) {
+      const cam = OnvifServer.cameraOfToken(extract(body, 'ProfileToken>([^<]+)<'));
       inner = '<trt:GetStreamUriResponse><trt:MediaUri>' +
-        `<tt:Uri>rtsp://${ip}:${RTSP_PORT}/cam</tt:Uri>` +
+        `<tt:Uri>rtsp://${ip}:${RTSP_PORT}/cam${cam}</tt:Uri>` +
         '<tt:InvalidAfterConnect>false</tt:InvalidAfterConnect>' +
         '<tt:InvalidAfterReboot>false</tt:InvalidAfterReboot>' +
         '<tt:Timeout>60</tt:Timeout>' +
         '</trt:MediaUri></trt:GetStreamUriResponse>';
+    } else if (body.indexOf('GetSnapshotUri') >= 0) {
+      /* 快照通道:HTTP 单帧 JPEG,供不支持 RTSP 的客户端降级轮询 */
+      const cam = OnvifServer.cameraOfToken(extract(body, 'ProfileToken>([^<]+)<'));
+      const suffix = cam === 0 ? '' : `?cam=${cam}`;
+      inner = '<trt:GetSnapshotUriResponse><trt:MediaUri>' +
+        `<tt:Uri>http://${ip}:${HttpServer.port()}/snapshot.jpg${suffix}</tt:Uri>` +
+        '<tt:InvalidAfterConnect>false</tt:InvalidAfterConnect>' +
+        '<tt:InvalidAfterReboot>false</tt:InvalidAfterReboot>' +
+        '<tt:Timeout>60</tt:Timeout>' +
+        '</trt:MediaUri></trt:GetSnapshotUriResponse>';
     } else if (body.indexOf('GetDeviceInformation') >= 0) {
       inner = '<tds:GetDeviceInformationResponse>' +
         '<td:Manufacturer>linuxsuren</td:Manufacturer>' +
-        '<td:Model>ohos-ipcam</td:Model>' +
-        '<td:FirmwareVersion>0.1.0</td:FirmwareVersion>' +
+        `<td:Model>${xmlEscape(deviceModel())}</td:Model>` +
+        `<td:FirmwareVersion>${xmlEscape(deviceOs())}</td:FirmwareVersion>` +
+        `<td:SerialNumber>${OnvifServer.deviceId}</td:SerialNumber>` +
+        `<td:HardwareId>${xmlEscape(deviceHardware())}</td:HardwareId>` +
         '</tds:GetDeviceInformationResponse>';
     }
     const soapBody = inner !== '' ? inner :
       '<tds:GetDeviceInformationResponse/>';
     return 'HTTP/1.1 200 OK\r\nContent-Type: application/soap+xml; charset=utf-8\r\n' +
-      `Content-Length: ${str2ab(OnvifServer.soapEnvelope(soapBody)).byteLength}\r\nConnection: close\r\n\r\n` +
+      `Content-Length: ${utf8(OnvifServer.soapEnvelope(soapBody)).byteLength}\r\nConnection: close\r\n\r\n` +
       OnvifServer.soapEnvelope(soapBody);
   }
 
@@ -242,5 +337,18 @@ export class OnvifServer {
       'xmlns:trt="http://www.onvif.org/ver10/media/wsdl" ' +
       'xmlns:tt="http://www.onvif.org/ver10/schema">' +
       `<s:Body>${inner}</s:Body></s:Envelope>`;
+  }
+
+  /** profile_N → 相机编号(N-1),无法解析按 0 号处理。 */
+  private static cameraOfToken(token: string): number {
+    if (token === undefined || token === '') {
+      return 0;
+    }
+    const under = token.lastIndexOf('_');
+    const n = parseInt(token.substring(under + 1).trim());
+    if (isNaN(n)) {
+      return 0;
+    }
+    return Math.max(0, n - 1);
   }
 }

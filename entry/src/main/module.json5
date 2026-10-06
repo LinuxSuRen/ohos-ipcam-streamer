@@ -42,6 +42,7 @@
         "startWindowIcon": "$media:startIcon",
         "startWindowBackground": "$color:start_window_background",
         "orientation": "portrait",
+        "backgroundModes": ["dataTransfer"],
         "skills": [
           {
             "entities": ["entity.system.home"],
