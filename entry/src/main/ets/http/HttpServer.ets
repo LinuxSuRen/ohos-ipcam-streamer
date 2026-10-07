@@ -251,6 +251,7 @@ class HttpConnection {
       `<body style='font-family:monospace;background:#111;color:#eee;padding:2em'>` +
       `<h2>ohos-ipcam-streamer</h2>` +
       `<p>device: ${deviceModel()} (${deviceOs()})</p>` +
+      `<p>audio: ${RtspServer.isAudioEnabled() ? 'AAC 44100Hz stereo (SDP trackID=1)' : 'none'}</p>` +
       `<p>rtsp clients=${RtspServer.sessionCount()}</p>` +
       `<p><a style='color:#8cf' href='http://${ip}:8000/onvif/device_service'>onvif</a></p>`;
     for (const c of CamRegistry.list()) {

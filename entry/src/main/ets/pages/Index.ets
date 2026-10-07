@@ -56,6 +56,8 @@ struct Index {
   @State httpUrl: string = '';
   @State suggestDeg: number = -1;
   @State crashText: string = '';
+  @State audioText: string = '';
+  private audioOn: boolean = false;
   private timerId: number = -1;
   private curRotate: number = 0;
   private camInfos: CamInfo[] = [];
@@ -144,6 +146,9 @@ struct Index {
       });
       const audioOk = isMicGranted() && H264Encoder.startAudioPipeline();
       RtspServer.setAudioEnabled(audioOk);
+      this.audioOn = audioOk;
+      this.audioText = audioOk ? 'AAC 44.1kHz 立体声' :
+        (isMicGranted() ? '不可用(启动失败,已降级纯视频)' : '未授权麦克风');
 
       /* 阶段二:全部编码器实例常驻启动,再尽量并发打开全部相机 */
       this.status = '启动编码器';
@@ -166,8 +171,7 @@ struct Index {
         }
       }
       CamRegistry.set(this.camInfos);
-      this.profileText = this.camInfos.map((c) => `${c.label} ${c.outW}x${c.outH}`).join(' / ') +
-        (audioOk ? ' +音频' : '');
+      this.profileText = this.camInfos.map((c) => `${c.label} ${c.outW}x${c.outH}`).join(' / ');
 
       await BackgroundKeeper.start(getAbilityContext()!);
 
@@ -254,6 +258,8 @@ struct Index {
     }
     await this.cleanup();
     this.running = false;
+    this.audioOn = false;
+    this.audioText = '';
     this.status = '已停止';
   }
 
@@ -351,6 +357,10 @@ struct Index {
         Text(`状态: ${this.status}`).fontSize(14).fontColor('#E6E6E6')
         if (this.profileText !== '') {
           Text(`输出: ${this.profileText}`).fontSize(14).fontColor('#E6E6E6')
+        }
+        if (this.running) {
+          Text(`音频: ${this.audioOn ? this.audioText : '关'}`)
+            .fontSize(13).fontColor(this.audioOn ? '#9FD8A0' : '#888888')
         }
         if (this.stats !== '') {
           Text(this.stats).fontSize(13).fontColor('#E6E6E6')
