@@ -4,7 +4,7 @@ import Want from '@ohos.app.ability.Want';
 import window from '@ohos.window';
 import hilog from '@ohos.hilog';
 import { abilityAccessCtrl, Permissions } from '@kit.AbilityKit';
-import { setAbilityContext, setCameraGranted, initPersisted } from './GlobalContext';
+import { setAbilityContext, setCameraGranted, initPersisted, setAppForeground } from './GlobalContext';
 import { CrashGuard } from './CrashGuard';
 
 const DOMAIN = 0x0801;
@@ -62,9 +62,11 @@ export default class EntryAbility extends UIAbility {
 
   onForeground(): void {
     hilog.info(DOMAIN, TAG, 'onForeground');
+    setAppForeground(true);
   }
 
   onBackground(): void {
     hilog.info(DOMAIN, TAG, 'onBackground');
+    setAppForeground(false);
   }
 }

@@ -202,24 +202,26 @@ export class CameraSource {
     if (i >= 0) {
       CameraSource.runtimes.splice(i, 1);
     }
-    /* 每步都加超时:HAL 个别调用不回调会卡死 */
+    /* 每步都加超时:HAL 个别调用不回调会卡死。深度休眠下 HAL 响应极慢,
+     * 超时太短、过早放弃会让设备停在半开状态(7400201 反复失败,
+     * 实测仅进程退出才能解除),故给到 8s。 */
     try {
-      await CameraSource.withTimeout(rt.session.stop(), 3000, 'session.stop');
+      await CameraSource.withTimeout(rt.session.stop(), 8000, 'session.stop');
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'session stop');
     }
     try {
-      await CameraSource.withTimeout(rt.session.release(), 3000, 'session.release');
+      await CameraSource.withTimeout(rt.session.release(), 8000, 'session.release');
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'session release');
     }
     try {
-      await CameraSource.withTimeout(rt.preview.release(), 3000, 'preview.release');
+      await CameraSource.withTimeout(rt.preview.release(), 8000, 'preview.release');
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'preview release');
     }
     try {
-      await CameraSource.withTimeout(rt.input.close(), 3000, 'input.close');
+      await CameraSource.withTimeout(rt.input.close(), 8000, 'input.close');
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'input close');
     }
