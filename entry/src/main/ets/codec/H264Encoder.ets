@@ -12,7 +12,7 @@ export interface EncodedFrame {
 }
 
 type FrameListener = (f: EncodedFrame) => void;
-type AudioFrameListener = (frame: ArrayBuffer) => void;
+type AudioFrameListener = (frame: ArrayBuffer, type: number) => void;
 
 let listener: FrameListener | null = null;
 let audioListener: AudioFrameListener | null = null;
@@ -32,21 +32,21 @@ export class H264Encoder {
     });
   }
 
-  /** 注册音频帧回调(AAC 裸帧)。 */
+  /** 注册音频帧回调:type 0 = AAC,1 = G.711 PCMA。 */
   static setAudioListener(cb: AudioFrameListener): void {
     audioListener = cb;
-    setAudioCallback((frame: ArrayBuffer) => {
+    setAudioCallback((frame: ArrayBuffer, type: number) => {
       if (audioListener !== null) {
-        audioListener(frame);
+        audioListener(frame, type);
       }
     });
   }
 
-  /** 启动音频管线(麦克风+AAC);失败返回 false,视频不受影响。 */
-  static startAudioPipeline(): boolean {
-    const ok = startAudio() === 1;
-    hilog.info(DOMAIN, TAG, 'audio pipeline %{public}s', ok ? 'started' : 'unavailable');
-    return ok;
+  /** 启动音频管线(麦克风+AAC+G.711);返回 0=失败 1=仅G.711 2=AAC+G.711。 */
+  static startAudioPipeline(): number {
+    const r = startAudio();
+    hilog.info(DOMAIN, TAG, 'audio pipeline level=%{public}d', r);
+    return r;
   }
 
   static stopAudioPipeline(): void {

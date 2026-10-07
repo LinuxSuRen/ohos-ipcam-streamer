@@ -468,7 +468,79 @@ static volatile int g_audio_ok = 0;
 typedef struct {
     uint8_t *data;
     int32_t size;
+    int type; /* 0 = AAC 裸帧, 1 = G.711 PCMA 帧(160 字节 = 20ms) */
 } audio_msg_t;
+
+/* G.711 状态:48k 立体声 → 单声道 → 6:1 抽取到 8k → 160 样本一包 */
+#define G711_SAMPLES_PER_PKT 160
+#define G711_DECIM 6
+static int32_t g_g711_sum = 0;
+static int g_g711_phase = 0;
+static int16_t g_g711_pcm[G711_SAMPLES_PER_PKT];
+static int g_g711_count = 0;
+
+/* ITU-T G.711 A-law 编码(13 段折线) */
+static uint8_t linear2alaw(int16_t pcm_val)
+{
+    static const int16_t seg_end[8] = {0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF, 0x1FFF, 0x3FFF, 0x7FFF};
+    const int16_t mask = 0xD5;
+    int16_t seg;
+    uint8_t aval;
+    pcm_val = (int16_t)(pcm_val >> 3); /* 16 -> 13 bit */
+    if (pcm_val >= 0) {
+        /* 正数直接分段 */
+    } else {
+        pcm_val = (int16_t)(-pcm_val - 1);
+    }
+    for (seg = 0; seg < 8; seg++) {
+        if (pcm_val <= seg_end[seg]) {
+            break;
+        }
+    }
+    if (seg >= 8) {
+        return (uint8_t)(0x7F ^ mask);
+    }
+    aval = (uint8_t)(seg << 4);
+    if (seg < 2) {
+        aval |= (uint8_t)((pcm_val >> 1) & 0x0F);
+    } else {
+        aval |= (uint8_t)((pcm_val >> seg) & 0x0F);
+    }
+    return (uint8_t)(aval ^ mask);
+}
+
+/* 48k 立体声 PCM → 下采样 → PCMA 帧;每凑满 160 样本经 tsfn 发一帧 */
+static void g711_feed(const int16_t *pcm, int32_t samples /* 每通道样本数 */)
+{
+    for (int32_t i = 0; i < samples; i++) {
+        const int32_t mono = ((int32_t)pcm[i * 2] + pcm[i * 2 + 1]) / 2;
+        g_g711_sum += mono;
+        if (++g_g711_phase == G711_DECIM) {
+            g_g711_pcm[g_g711_count++] = (int16_t)(g_g711_sum / G711_DECIM);
+            g_g711_sum = 0;
+            g_g711_phase = 0;
+            if (g_g711_count == G711_SAMPLES_PER_PKT) {
+                if (g_audio_tsfn != NULL) {
+                    audio_msg_t *msg = (audio_msg_t *)malloc(sizeof(audio_msg_t));
+                    if (msg != NULL) {
+                        msg->data = (uint8_t *)malloc(G711_SAMPLES_PER_PKT);
+                        msg->size = G711_SAMPLES_PER_PKT;
+                        msg->type = 1;
+                        if (msg->data != NULL) {
+                            for (int j = 0; j < G711_SAMPLES_PER_PKT; j++) {
+                                msg->data[j] = linear2alaw(g_g711_pcm[j]);
+                            }
+                            napi_call_threadsafe_function(g_audio_tsfn, msg, napi_tsfn_blocking);
+                        } else {
+                            free(msg);
+                        }
+                    }
+                }
+                g_g711_count = 0;
+            }
+        }
+    }
+}
 
 static void audio_call_js(napi_env env, napi_value js_cb, void *context, void *data)
 {
@@ -478,10 +550,12 @@ static void audio_call_js(napi_env env, napi_value js_cb, void *context, void *d
     if (msg->size > 0 && msg->data != NULL) {
         void *ab_data = NULL;
         napi_value ab = NULL;
+        napi_value type = NULL;
         if (napi_create_arraybuffer(env, msg->size, &ab_data, &ab) == napi_ok) {
             memcpy(ab_data, msg->data, msg->size);
-            napi_value argv[1] = {ab};
-            napi_call_function(env, undefined, js_cb, 1, argv, NULL);
+            napi_create_int32(env, msg->type, &type);
+            napi_value argv[2] = {ab, type};
+            napi_call_function(env, undefined, js_cb, 2, argv, NULL);
         }
     }
     free(msg->data);
@@ -521,6 +595,7 @@ static void audio_on_new_output(OH_AVCodec *codec, uint32_t index, OH_AVMemory *
     if (msg != NULL) {
         msg->data = (uint8_t *)malloc((size_t)attr->size);
         msg->size = attr->size;
+        msg->type = 0;
         if (msg->data != NULL && src != NULL) {
             memcpy(msg->data, src, (size_t)attr->size);
             if (g_audio_tsfn != NULL) {
@@ -541,6 +616,9 @@ static int32_t audio_on_read(OH_AudioCapturer *capturer, void *userData, void *b
 {
     if (!g_audio_ok) {
         return 0;
+    }
+    if (g_audio_ok) {
+        g711_feed((const int16_t *)buffer, size / 4 /* 立体声 16bit */);
     }
     pthread_mutex_lock(&g_aiq_lock);
     if (g_aiq_count > 0 && g_aenc != NULL) {
@@ -605,6 +683,9 @@ static void audio_teardown(void)
     pthread_mutex_lock(&g_aiq_lock);
     g_aiq_head = g_aiq_tail = g_aiq_count = 0;
     pthread_mutex_unlock(&g_aiq_lock);
+    g_g711_phase = 0;
+    g_g711_sum = 0;
+    g_g711_count = 0;
 }
 
 /** 启动麦克风采集 + AAC-LC 编码(44100/立体声/64kbps)。
@@ -614,16 +695,17 @@ static napi_value native_start_audio(napi_env env, napi_callback_info info)
     (void)info;
     if (g_audio_ok) {
         napi_value r;
-        napi_create_int32(env, 1, &r);
+        napi_create_int32(env, g_aenc != NULL ? 2 : 1, &r);
         return r;
     }
+    int aac_ok = 0;
     do {
         OH_AudioStreamBuilder *builder = NULL;
         if (OH_AudioStreamBuilder_Create(&builder, AUDIOSTREAM_TYPE_CAPTURER) != AUDIOSTREAM_SUCCESS) {
             LOGE("audio builder create failed");
             break;
         }
-        OH_AudioStreamBuilder_SetSamplingRate(builder, 44100);
+        OH_AudioStreamBuilder_SetSamplingRate(builder, 48000);
         OH_AudioStreamBuilder_SetChannelCount(builder, 2);
         OH_AudioStreamBuilder_SetSampleFormat(builder, AUDIOSTREAM_SAMPLE_S16LE);
         struct OH_AudioCapturer_Callbacks_Struct cbs;
@@ -645,9 +727,11 @@ static napi_value native_start_audio(napi_env env, napi_callback_info info)
             enc = OH_AudioEncoder_CreateByName("avenc_aac");
         }
         if (enc == NULL) {
-            LOGE("create aac encoder failed (mime+name)");
+            /* AAC 不可用:仅 G.711(纯软件)继续 */
+            LOGE("aac encoder unavailable, G.711 only");
             break;
         }
+        aac_ok = 1;
         /* 音频编码器仅提供 legacy 回调(AVMemory 型),写入用 OH_AVMemory_GetAddr,
          * 提交用新式 PushInputData(index+attr),两者混用为官方示例做法 */
         OH_AVCodecAsyncCallback cb = {
@@ -660,7 +744,7 @@ static napi_value native_start_audio(napi_env env, napi_callback_info info)
             OH_AudioEncoder_Destroy(enc);
             break;
         }
-        OH_AVFormat *fmt = OH_AVFormat_CreateAudioFormat("audio/aac", 44100, 2);
+        OH_AVFormat *fmt = OH_AVFormat_CreateAudioFormat("audio/aac", 48000, 2);
         OH_AVFormat_SetIntValue(fmt, OH_MD_KEY_AUDIO_SAMPLE_FORMAT, SAMPLE_S16LE);
         OH_AVFormat_SetLongValue(fmt, OH_MD_KEY_BITRATE, 64000);
         OH_AVErrCode rc = OH_AudioEncoder_Configure(enc, fmt);
@@ -681,13 +765,13 @@ static napi_value native_start_audio(napi_env env, napi_callback_info info)
             break;
         }
         g_audio_ok = 1;
-        LOGI("audio pipeline started (44100/2ch aac 64kbps)");
+        LOGI("audio pipeline started (48000/2ch, %{public}s)", aac_ok ? "aac+g711" : "g711 only");
     } while (0);
     if (!g_audio_ok) {
         audio_teardown();
     }
     napi_value r;
-    napi_create_int32(env, g_audio_ok, &r);
+    napi_create_int32(env, g_audio_ok ? (g_aenc != NULL ? 2 : 1) : 0, &r);
     return r;
 }
 

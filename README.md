@@ -22,9 +22,11 @@
 
 ## 功能
 
-- **音频随视频协商推送**:麦克风采集 + AAC-LC 44100 立体声 64kbps;RTSP SDP 提供
-  音频轨道(trackID=1),客户端经 SETUP 协商接收——不 SETUP 则只收视频;
-  ONVIF Profile 声明 AudioEncoderConfiguration(AAC)。麦克风不可用时自动降级纯视频
+- **音频随视频协商推送(双音轨)**:麦克风采集(48kHz)→ AAC-LC(trackID=1,PT 97)
+  + G.711 PCMA(trackID=2,PT 8,8kHz/20ms)双编码;客户端经 RTSP SETUP 按轨协商,
+  各取所需——只 SETUP 视频轨则无音频,兼容 AAC 的播放器(ffmpeg/VLC)取 AAC,
+  ONVIF 生态设备/NVR 取 G.711。AAC 编码器不可用时自动降级仅 G.711;麦克风不可用
+  时降级纯视频。ONVIF Profile 声明 AudioEncoderConfiguration(G711,生态惯例)
 - **多摄像头并发推流**:前后置(及多摄)同时输出,每路独立 RTSP 地址与 ONVIF Profile
 - RTSP / HTTP(MJPEG+快照) / ONVIF 三协议,ONVIF 每相机一个 Profile(token=profile_{N+1})
 - HTTP 状态页:设备信息、各路统计(fps/帧数)、入口链接、内嵌预览、上次崩溃堆栈
@@ -98,8 +100,9 @@ API 基线 5.0.0 (API 12);已实测 HarmonyOS 6.1.1 (API 24) 真机(SGT-AL50,前
 
 ## 已验证
 
-- 音频端到端:ffmpeg 拉流解出 AAC 44100 立体声;仅 SETUP 视频轨的客户端
-  收不到任何音频包(协商生效);ONVIF Profile 含 AAC AudioEncoderConfiguration
+- 音频端到端:ffmpeg 拉流解出 AAC 48000 立体声与 G.711(pcm_alaw 8000 单声道,
+  电平实测正常);仅 SETUP 视频轨的客户端收不到任何音频包、仅 SETUP G.711 轨的
+  客户端 0 AAC 包(协商生效);onvif-ai 联调自动选择 G.711 轨并在界面显示
 - 前后摄并发双路 RTSP 同时拉流:1280x720 横屏与 704x1280 竖屏均零解码错误
 - HTTP 状态页 / 每路快照 / 每路 MJPEG 流(多路并发请求合流编码)
 - ONVIF:GetProfiles 多 Profile(相机名/分辨率动态)、GetStreamUri/GetSnapshotUri 按 Profile 映射、WS-Discovery Probe 应答与 Hello

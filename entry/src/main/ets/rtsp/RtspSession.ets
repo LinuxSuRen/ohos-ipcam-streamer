@@ -43,8 +43,11 @@ export class RtspSession {
   private waitKey: boolean = true;
   private camera: number = 0;
   private audioSetUp: boolean = false;
+  private g711SetUp: boolean = false;
   private audioPkt: RtpPacketizer;
+  private g711Pkt: RtpPacketizer;
   private audioSamples: number = 0;
+  private g711Samples: number = 0;
   private epoch: number = 0;
   private lastTs: number = -1;
   private sendChain: Promise<void> = Promise.resolve();
@@ -54,6 +57,7 @@ export class RtspSession {
     this.fps = fps > 0 ? fps : 25;
     this.packetizer = new RtpPacketizer();
     this.audioPkt = new RtpPacketizer();
+    this.g711Pkt = new RtpPacketizer();
     this.sessionId = String(Math.floor(Math.random() * 900000) + 100000);
   }
 
@@ -133,8 +137,12 @@ export class RtspSession {
         }
         this.camera = cameraOfUrl(url);
         this.sessionUrl = url;
-        if (url.indexOf('trackID=1') >= 0) {
-          /* 音频轨道:客户端经 SETUP 协商后才接收音频(interleaved 2-3) */
+        if (url.indexOf('trackID=2') >= 0) {
+          /* G.711 音轨:客户端经 SETUP trackID=2 协商(interleaved 4-5) */
+          this.g711SetUp = true;
+          this.send(`RTSP/1.0 200 OK\r\nCSeq: ${cseq}\r\nSession: ${this.sessionId}\r\nTransport: RTP/AVP/TCP;interleaved=4-5;ssrc=1A2B3C4F\r\n\r\n`);
+        } else if (url.indexOf('trackID=1') >= 0) {
+          /* AAC 音轨:客户端经 SETUP 协商后才接收音频(interleaved 2-3) */
           this.audioSetUp = true;
           this.send(`RTSP/1.0 200 OK\r\nCSeq: ${cseq}\r\nSession: ${this.sessionId}\r\nTransport: RTP/AVP/TCP;interleaved=2-3;ssrc=1A2B3C4E\r\n\r\n`);
         } else {
@@ -210,7 +218,7 @@ export class RtspSession {
     this.audioSamples += 1024;
     const pkt = new Uint8Array(12 + 2 + 2 + aac.length);
     /* RTP 头:PT=97,marker=1;时间戳为样本单位(44100Hz 时钟) */
-    this.audioPkt.fillAudio(pkt, this.audioSamples & 0xffffffff);
+    this.audioPkt.fillAudio(pkt, this.audioSamples & 0xffffffff, 97);
     /* AU-headers-length = 16(bit) */
     pkt[12] = 0x00;
     pkt[13] = 0x10;
@@ -222,6 +230,31 @@ export class RtspSession {
     const out = new Uint8Array(4 + pkt.length);
     out[0] = 0x24;
     out[1] = 2;
+    out[2] = (pkt.length >> 8) & 0xff;
+    out[3] = pkt.length & 0xff;
+    out.set(pkt, 4);
+    const ab: ArrayBuffer = new ArrayBuffer(out.length);
+    new Uint8Array(ab).set(out);
+    this.sendRaw(ab);
+  }
+
+  /** G.711 PCMA 帧(160 字节 = 20ms)→ RTP(PT 8,8kHz 样本时钟)。
+   * 只发给经 SETUP trackID=2 协商过 G.711 的会话(interleaved 通道 4)。 */
+  onG711Frame(frame: ArrayBuffer): void {
+    if (!this.playing || !this.g711SetUp || this.dead) {
+      return;
+    }
+    const pcma = new Uint8Array(frame);
+    if (pcma.length <= 0 || pcma.length > 1024) {
+      return;
+    }
+    this.g711Samples += pcma.length; /* 1 字节 = 1 样本(8kHz) */
+    const pkt = new Uint8Array(12 + pcma.length);
+    this.g711Pkt.fillAudio(pkt, this.g711Samples & 0xffffffff, 8);
+    pkt.set(pcma, 12);
+    const out = new Uint8Array(4 + pkt.length);
+    out[0] = 0x24;
+    out[1] = 4;
     out[2] = (pkt.length >> 8) & 0xff;
     out[3] = pkt.length & 0xff;
     out.set(pkt, 4);

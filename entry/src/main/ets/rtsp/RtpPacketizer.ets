@@ -69,11 +69,11 @@ export class RtpPacketizer {
     pkt[11] = this.ssrc & 0xff;
   }
 
-  /** 音频 RTP(MPEG4-GENERIC,PT=97,marker=1):向 pkt 前 12 字节填头。 */
-  fillAudio(pkt: Uint8Array, ts: number): void {
+  /** 音频 RTP(marker=1):向 pkt 前 12 字节填头,PT 由调用方给出(97=AAC,8=PCMA)。 */
+  fillAudio(pkt: Uint8Array, ts: number, pt: number): void {
     this.seq = (this.seq + 1) & 0xffff;
     pkt[0] = 0x80;
-    pkt[1] = 97 | 0x80;
+    pkt[1] = pt | 0x80;
     pkt[2] = (this.seq >> 8) & 0xff;
     pkt[3] = this.seq & 0xff;
     pkt[4] = (ts >>> 24) & 0xff;

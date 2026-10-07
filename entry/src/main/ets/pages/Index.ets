@@ -140,15 +140,22 @@ struct Index {
       await OnvifServer.start(getAbilityContext()!);
       await HttpServer.start();
 
-      /* 音频管线(可选):麦克风 → AAC,失败仅降级为纯视频 */
-      H264Encoder.setAudioListener((frame) => {
-        RtspServer.broadcastAudio(frame);
+      /* 音频管线(可选):麦克风 → AAC + G.711 双编码,失败仅降级为纯视频 */
+      H264Encoder.setAudioListener((frame, type) => {
+        if (type === 1) {
+          RtspServer.broadcastG711(frame);
+        } else {
+          RtspServer.broadcastAudio(frame);
+        }
       });
-      const audioOk = isMicGranted() && H264Encoder.startAudioPipeline();
+      const audioLevel = isMicGranted() ? H264Encoder.startAudioPipeline() : 0;
+      const audioOk = audioLevel >= 2;
       RtspServer.setAudioEnabled(audioOk);
-      this.audioOn = audioOk;
-      this.audioText = audioOk ? 'AAC 44.1kHz 立体声' :
-        (isMicGranted() ? '不可用(启动失败,已降级纯视频)' : '未授权麦克风');
+      RtspServer.setG711Enabled(audioLevel >= 1);
+      this.audioOn = audioLevel >= 1;
+      this.audioText = audioLevel >= 2 ? 'AAC 48kHz 立体声 + G.711' :
+        (audioLevel === 1 ? 'G.711(AAC 不可用)' :
+          (isMicGranted() ? '不可用(启动失败,已降级纯视频)' : '未授权麦克风'));
 
       /* 阶段二:全部编码器实例常驻启动,再尽量并发打开全部相机 */
       this.status = '启动编码器';
@@ -245,6 +252,7 @@ struct Index {
     FrameHub.endDump();
     JpegSource.reset();
     RtspServer.setAudioEnabled(false);
+    RtspServer.setG711Enabled(false);
     H264Encoder.stopAudioPipeline();
     await RtspServer.stop();
     await OnvifServer.stop();

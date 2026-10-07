@@ -78,6 +78,7 @@ export class RtspServer {
   private static sessions: RtspSession[] = [];
   private static fps: number = 25;
   private static audioReady: boolean = false;
+  private static g711Ready: boolean = false;
 
   static setAudioEnabled(enabled: boolean): void {
     RtspServer.audioReady = enabled;
@@ -85,6 +86,14 @@ export class RtspServer {
 
   static isAudioEnabled(): boolean {
     return RtspServer.audioReady;
+  }
+
+  static setG711Enabled(enabled: boolean): void {
+    RtspServer.g711Ready = enabled;
+  }
+
+  static isG711Enabled(): boolean {
+    return RtspServer.g711Ready;
   }
 
   static async start(fps: number): Promise<void> {
@@ -141,13 +150,23 @@ export class RtspServer {
     }
   }
 
-  /** 音频帧分发(AAC 裸帧):只投给经 SETUP 协商了音频轨道的会话。 */
+  /** 音频帧分发(AAC 裸帧):只投给经 SETUP 协商了音频轨道(trackID=1)的会话。 */
   static broadcastAudio(frame: ArrayBuffer): void {
     if (!RtspServer.audioReady) {
       return;
     }
     for (const s of RtspServer.sessions) {
       s.onAudioFrame(frame);
+    }
+  }
+
+  /** G.711 PCMA 帧分发:只投给经 SETUP trackID=2 协商的会话。 */
+  static broadcastG711(frame: ArrayBuffer): void {
+    if (!RtspServer.g711Ready) {
+      return;
+    }
+    for (const s of RtspServer.sessions) {
+      s.onG711Frame(frame);
     }
   }
 
@@ -188,13 +207,20 @@ export class RtspServer {
       `a=fmtp:${PAYLOAD_TYPE} packetization-mode=1;${sprop}profile-level-id=${profile}\r\n` +
       `a=control:trackID=0\r\n`;
     if (RtspServer.audioReady) {
-      /* 音频轨道:客户端经 SETUP trackID=1 协商接收(不 SETUP 则无音频),
-       * MPEG4-GENERIC AAC-hbr,config=1210 即 AAC-LC 44100 立体声 ASC */
+      /* AAC 音轨:客户端经 SETUP trackID=1 协商接收(不 SETUP 则无音频),
+       * MPEG4-GENERIC AAC-hbr,config=1190 即 AAC-LC 48000 立体声 ASC */
       sdp += `m=audio 0 RTP/AVP 97\r\n` +
-        `a=rtpmap:97 MPEG4-GENERIC/44100/2\r\n` +
+        `a=rtpmap:97 MPEG4-GENERIC/48000/2\r\n` +
         `a=fmtp:97 streamtype=5;profile-level-id=1;mode=AAC-hbr;` +
-        `sizelength=13;indexlength=3;indexdeltalength=3;config=1210\r\n` +
+        `sizelength=13;indexlength=3;indexdeltalength=3;config=1190\r\n` +
         `a=control:trackID=1\r\n`;
+    }
+    if (RtspServer.g711Ready) {
+      /* G.711 A-law 音轨:ONVIF 生态事实标准,8kHz/单声道 20ms 一包,
+       * 静态载荷类型 8(PCMA);客户端经 SETUP trackID=2 协商接收 */
+      sdp += `m=audio 0 RTP/AVP 8\r\n` +
+        `a=rtpmap:8 PCMA/8000/1\r\n` +
+        `a=control:trackID=2\r\n`;
     }
     return sdp;
   }
