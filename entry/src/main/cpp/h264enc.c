@@ -474,10 +474,22 @@ typedef struct {
 /* G.711 状态:48k 立体声 → 单声道 → 6:1 抽取到 8k → 160 样本一包 */
 #define G711_SAMPLES_PER_PKT 160
 #define G711_DECIM 6
-static int32_t g_g711_sum = 0;
+#define G711_FIR_TAPS 33
 static int g_g711_phase = 0;
 static int16_t g_g711_pcm[G711_SAMPLES_PER_PKT];
 static int g_g711_count = 0;
+static int16_t g_g711_hist[G711_FIR_TAPS]; /* 最近 33 个单声道 48k 样本(循环写) */
+static int g_g711_hist_pos = 0;
+/* 33 阶 Hamming 窗 sinc 低通,截止 3.4kHz @48k,DC 增益 1。
+ * 裸均值抽取无抗混叠:4kHz 以上能量折叠回语音频段,听感沙哑浑浊。 */
+static const float g_g711_fir[G711_FIR_TAPS] = {
+    +0.001178f, +0.000719f, -0.000136f, -0.001833f, -0.004591f, -0.008062f,
+    -0.011148f, -0.012063f, -0.008706f, +0.000747f, +0.017180f, +0.040029f,
+    +0.067096f, +0.094813f, +0.118903f, +0.135310f, +0.141130f, +0.135310f,
+    +0.118903f, +0.094813f, +0.067096f, +0.040029f, +0.017180f, +0.000747f,
+    -0.008706f, -0.012063f, -0.011148f, -0.008062f, -0.004591f, -0.001833f,
+    -0.000136f, +0.000719f, +0.001178f,
+};
 
 /* ITU-T G.711 A-law 编码(13 段折线) */
 static uint8_t linear2alaw(int16_t pcm_val)
@@ -514,10 +526,24 @@ static void g711_feed(const int16_t *pcm, int32_t samples /* 每通道样本数 
 {
     for (int32_t i = 0; i < samples; i++) {
         const int32_t mono = ((int32_t)pcm[i * 2] + pcm[i * 2 + 1]) / 2;
-        g_g711_sum += mono;
+        /* 入 FIR 历史,每 6 个样本卷积输出一个 8k 样本(带内无混叠) */
+        g_g711_hist[g_g711_hist_pos] = (int16_t)mono;
+        g_g711_hist_pos = (g_g711_hist_pos + 1) % G711_FIR_TAPS;
         if (++g_g711_phase == G711_DECIM) {
-            g_g711_pcm[g_g711_count++] = (int16_t)(g_g711_sum / G711_DECIM);
-            g_g711_sum = 0;
+            float acc = 0.0f;
+            int idx = g_g711_hist_pos; /* 从最旧样本开始 */
+            for (int k = 0; k < G711_FIR_TAPS; k++) {
+                acc += g_g711_fir[k] * (float)g_g711_hist[idx];
+                idx = (idx + 1) % G711_FIR_TAPS;
+            }
+            int32_t v = (int32_t)acc;
+            if (v > 32767) {
+                v = 32767;
+            }
+            if (v < -32768) {
+                v = -32768;
+            }
+            g_g711_pcm[g_g711_count++] = (int16_t)v;
             g_g711_phase = 0;
             if (g_g711_count == G711_SAMPLES_PER_PKT) {
                 if (g_audio_tsfn != NULL) {
@@ -684,8 +710,9 @@ static void audio_teardown(void)
     g_aiq_head = g_aiq_tail = g_aiq_count = 0;
     pthread_mutex_unlock(&g_aiq_lock);
     g_g711_phase = 0;
-    g_g711_sum = 0;
     g_g711_count = 0;
+    g_g711_hist_pos = 0;
+    memset(g_g711_hist, 0, sizeof(g_g711_hist));
 }
 
 /** 启动麦克风采集 + AAC-LC 编码(44100/立体声/64kbps)。
