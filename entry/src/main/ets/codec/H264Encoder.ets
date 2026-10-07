@@ -1,4 +1,5 @@
-import { setCallback, start, stop, createCapture, setCameraFormat, destroyCapture } from 'libh264enc.so';
+import { setCallback, start, stop, createCapture, setCameraFormat, destroyCapture,
+  setAudioCallback, startAudio, stopAudio } from 'libh264enc.so';
 import hilog from '@ohos.hilog';
 
 const DOMAIN = 0x0802;
@@ -11,13 +12,15 @@ export interface EncodedFrame {
 }
 
 type FrameListener = (f: EncodedFrame) => void;
+type AudioFrameListener = (frame: ArrayBuffer) => void;
 
 let listener: FrameListener | null = null;
+let audioListener: AudioFrameListener | null = null;
 
 /**
- * H.264 硬编封装(buffer 输入模式,多摄像头多实例):
- * ArkTS 注册回调 ← C 层(de-stride+旋转+编码)逐帧回调,帧带相机编号。
- * outW/outH 必须与旋转+32对齐裁剪后的尺寸一致。
+ * 媒体编码封装(buffer 输入模式,多摄像头多实例 + 可选音频):
+ * - 每路相机:ArkTS ← C 层(de-stride+旋转+H264 硬编)逐帧回调,帧带相机编号
+ * - 音频:麦克风采集 → AAC-LC 44100/2/64kbps,裸帧回调(每 AU 1024 样本)
  */
 export class H264Encoder {
   static setListener(cb: FrameListener): void {
@@ -27,6 +30,28 @@ export class H264Encoder {
         listener({ data: data, keyframe: keyframe, cam: cam });
       }
     });
+  }
+
+  /** 注册音频帧回调(AAC 裸帧)。 */
+  static setAudioListener(cb: AudioFrameListener): void {
+    audioListener = cb;
+    setAudioCallback((frame: ArrayBuffer) => {
+      if (audioListener !== null) {
+        audioListener(frame);
+      }
+    });
+  }
+
+  /** 启动音频管线(麦克风+AAC);失败返回 false,视频不受影响。 */
+  static startAudioPipeline(): boolean {
+    const ok = startAudio() === 1;
+    hilog.info(DOMAIN, TAG, 'audio pipeline %{public}s', ok ? 'started' : 'unavailable');
+    return ok;
+  }
+
+  static stopAudioPipeline(): void {
+    stopAudio();
+    hilog.info(DOMAIN, TAG, 'audio pipeline stopped');
   }
 
   /** 旋转后的编码输出尺寸(与 C 层 rot_out_dims 一致:宽度 32 对齐)。 */

@@ -6,6 +6,7 @@ import util from '@ohos.util';
 import { lanAddress } from '../net/NetUtil';
 import { CamRegistry } from '../net/CamRegistry';
 import { HttpServer } from '../http/HttpServer';
+import { RtspServer } from '../rtsp/RtspServer';
 import { deviceModel, deviceOs, deviceLabel, deviceHardware, ensureDeviceId } from '../entryability/DeviceIdentity';
 
 const DOMAIN = 0x0809;
@@ -292,8 +293,19 @@ export class OnvifServer {
           '<tt:Quality>4</tt:Quality>' +
           `<tt:RateControl><tt:FrameRateLimit>${c.fps}</tt:FrameRateLimit>` +
           `<tt:BitrateLimit>${kbps}</tt:BitrateLimit></tt:RateControl>` +
-          '</tt:VideoEncoderConfiguration>' +
-          '</trt:Profiles>';
+          '</tt:VideoEncoderConfiguration>';
+        if (RtspServer.isAudioEnabled()) {
+          /* 音频协商:Profile 声明 AAC 能力,客户端按需拉取 */
+          profiles += `<tt:AudioEncoderConfiguration token="aec_${n}">` +
+            `<tt:Name>aac_${n}</tt:Name>` +
+            '<tt:UseCount>1</tt:UseCount>' +
+            '<tt:Encoding>AAC</tt:Encoding>' +
+            '<tt:Bitrate>64</tt:Bitrate>' +
+            '<tt:SampleRate>44100</tt:SampleRate>' +
+            '<tt:SessionTimeout>PT60S</tt:SessionTimeout>' +
+            '</tt:AudioEncoderConfiguration>';
+        }
+        profiles += '</trt:Profiles>';
       }
       inner = `<trt:GetProfilesResponse>${profiles}</trt:GetProfilesResponse>`;
     } else if (body.indexOf('GetStreamUri') >= 0) {

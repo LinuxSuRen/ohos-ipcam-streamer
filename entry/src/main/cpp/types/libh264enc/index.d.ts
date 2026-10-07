@@ -16,3 +16,9 @@ export const snapshotWidth: (cam: number) => number;
 export const snapshotHeight: (cam: number) => number;
 /** 取指定相机最新旋转后帧的 RGBA 像素(按需 NV12→RGBA);尚无帧时返回 null */
 export const takeSnapshotRgba: (cam: number) => ArrayBuffer | null;
+/** 注册音频帧回调(AAC 裸帧,每个 AU 固定 1024 样本) */
+export const setAudioCallback: (cb: (frame: ArrayBuffer) => void) => void;
+/** 启动麦克风采集 + AAC-LC 44100 立体声 64kbps 编码;失败返回 0 */
+export const startAudio: () => number;
+/** 停止音频管线 */
+export const stopAudio: () => void;

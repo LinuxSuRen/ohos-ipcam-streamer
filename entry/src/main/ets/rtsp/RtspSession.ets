@@ -42,6 +42,9 @@ export class RtspSession {
   private dead: boolean = false;
   private waitKey: boolean = true;
   private camera: number = 0;
+  private audioSetUp: boolean = false;
+  private audioPkt: RtpPacketizer;
+  private audioSamples: number = 0;
   private epoch: number = 0;
   private lastTs: number = -1;
   private sendChain: Promise<void> = Promise.resolve();
@@ -50,6 +53,7 @@ export class RtspSession {
     this.conn = conn;
     this.fps = fps > 0 ? fps : 25;
     this.packetizer = new RtpPacketizer();
+    this.audioPkt = new RtpPacketizer();
     this.sessionId = String(Math.floor(Math.random() * 900000) + 100000);
   }
 
@@ -129,7 +133,13 @@ export class RtspSession {
         }
         this.camera = cameraOfUrl(url);
         this.sessionUrl = url;
-        this.send(`RTSP/1.0 200 OK\r\nCSeq: ${cseq}\r\nSession: ${this.sessionId}\r\nTransport: RTP/AVP/TCP;interleaved=0-1;ssrc=1A2B3C4D\r\n\r\n`);
+        if (url.indexOf('trackID=1') >= 0) {
+          /* 音频轨道:客户端经 SETUP 协商后才接收音频(interleaved 2-3) */
+          this.audioSetUp = true;
+          this.send(`RTSP/1.0 200 OK\r\nCSeq: ${cseq}\r\nSession: ${this.sessionId}\r\nTransport: RTP/AVP/TCP;interleaved=2-3;ssrc=1A2B3C4E\r\n\r\n`);
+        } else {
+          this.send(`RTSP/1.0 200 OK\r\nCSeq: ${cseq}\r\nSession: ${this.sessionId}\r\nTransport: RTP/AVP/TCP;interleaved=0-1;ssrc=1A2B3C4D\r\n\r\n`);
+        }
         break;
       }
       case 'PLAY':
@@ -185,6 +195,39 @@ export class RtspSession {
         this.sendInterleaved(p);
       }
     }
+  }
+
+  /** 音频帧(AAC 裸帧,每 AU 1024 样本)→ RFC 3640 MPEG4-GENERIC RTP。
+   * 只发给经 SETUP trackID=1 协商过音频的会话(interleaved 通道 2)。 */
+  onAudioFrame(frame: ArrayBuffer): void {
+    if (!this.playing || !this.audioSetUp || this.dead) {
+      return;
+    }
+    const aac = new Uint8Array(frame);
+    if (aac.length <= 0 || aac.length >= 8192) {
+      return;
+    }
+    this.audioSamples += 1024;
+    const pkt = new Uint8Array(12 + 2 + 2 + aac.length);
+    /* RTP 头:PT=97,marker=1;时间戳为样本单位(44100Hz 时钟) */
+    this.audioPkt.fillAudio(pkt, this.audioSamples & 0xffffffff);
+    /* AU-headers-length = 16(bit) */
+    pkt[12] = 0x00;
+    pkt[13] = 0x10;
+    /* AU header:13 bit 大小 + 3 bit index = size<<3 */
+    const au = aac.length << 3;
+    pkt[14] = (au >> 8) & 0xff;
+    pkt[15] = au & 0xff;
+    pkt.set(aac, 16);
+    const out = new Uint8Array(4 + pkt.length);
+    out[0] = 0x24;
+    out[1] = 2;
+    out[2] = (pkt.length >> 8) & 0xff;
+    out[3] = pkt.length & 0xff;
+    out.set(pkt, 4);
+    const ab: ArrayBuffer = new ArrayBuffer(out.length);
+    new Uint8Array(ab).set(out);
+    this.sendRaw(ab);
   }
 
   /** ts 跟随真实时钟,实际帧率与配置不符时播放速度仍正确;

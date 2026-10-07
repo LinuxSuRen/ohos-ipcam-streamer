@@ -22,6 +22,9 @@
 
 ## 功能
 
+- **音频随视频协商推送**:麦克风采集 + AAC-LC 44100 立体声 64kbps;RTSP SDP 提供
+  音频轨道(trackID=1),客户端经 SETUP 协商接收——不 SETUP 则只收视频;
+  ONVIF Profile 声明 AudioEncoderConfiguration(AAC)。麦克风不可用时自动降级纯视频
 - **多摄像头并发推流**:前后置(及多摄)同时输出,每路独立 RTSP 地址与 ONVIF Profile
 - RTSP / HTTP(MJPEG+快照) / ONVIF 三协议,ONVIF 每相机一个 Profile(token=profile_{N+1})
 - HTTP 状态页:设备信息、各路统计(fps/帧数)、入口链接、内嵌预览、上次崩溃堆栈
@@ -52,8 +55,8 @@
 拉流端:
 
 ```bash
-ffplay -rtsp_transport tcp rtsp://<手机IP>:8554/cam0    # 后置
-ffplay -rtsp_transport tcp rtsp://<手机IP>:8554/cam1    # 前置
+ffplay -rtsp_transport tcp rtsp://<手机IP>:8554/cam0    # 后置(含音频)
+ffplay -rtsp_transport tcp rtsp://<手机IP>:8554/cam1    # 前置(含音频)
 # OpenCV(需指定 TCP):
 #   os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp'
 #   cv2.VideoCapture('rtsp://<手机IP>:8554/cam0')
@@ -95,6 +98,8 @@ API 基线 5.0.0 (API 12);已实测 HarmonyOS 6.1.1 (API 24) 真机(SGT-AL50,前
 
 ## 已验证
 
+- 音频端到端:ffmpeg 拉流解出 AAC 44100 立体声;仅 SETUP 视频轨的客户端
+  收不到任何音频包(协商生效);ONVIF Profile 含 AAC AudioEncoderConfiguration
 - 前后摄并发双路 RTSP 同时拉流:1280x720 横屏与 704x1280 竖屏均零解码错误
 - HTTP 状态页 / 每路快照 / 每路 MJPEG 流(多路并发请求合流编码)
 - ONVIF:GetProfiles 多 Profile(相机名/分辨率动态)、GetStreamUri/GetSnapshotUri 按 Profile 映射、WS-Discovery Probe 应答与 Hello

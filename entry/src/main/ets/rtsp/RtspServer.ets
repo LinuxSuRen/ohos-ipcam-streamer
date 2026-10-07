@@ -77,6 +77,15 @@ export class RtspServer {
   private static server: socket.TCPSocketServer | null = null;
   private static sessions: RtspSession[] = [];
   private static fps: number = 25;
+  private static audioReady: boolean = false;
+
+  static setAudioEnabled(enabled: boolean): void {
+    RtspServer.audioReady = enabled;
+  }
+
+  static isAudioEnabled(): boolean {
+    return RtspServer.audioReady;
+  }
 
   static async start(fps: number): Promise<void> {
     if (RtspServer.server !== null) {
@@ -132,6 +141,16 @@ export class RtspServer {
     }
   }
 
+  /** 音频帧分发(AAC 裸帧):只投给经 SETUP 协商了音频轨道的会话。 */
+  static broadcastAudio(frame: ArrayBuffer): void {
+    if (!RtspServer.audioReady) {
+      return;
+    }
+    for (const s of RtspServer.sessions) {
+      s.onAudioFrame(frame);
+    }
+  }
+
   static remove(session: RtspSession): void {
     const i = RtspServer.sessions.indexOf(session);
     if (i >= 0) {
@@ -160,13 +179,23 @@ export class RtspServer {
         profile = hex(sps[1]) + hex(sps[2]) + hex(sps[3]);
       }
     }
-    return `v=0\r\n` +
+    let sdp = `v=0\r\n` +
       `o=- 0 0 IN IP4 ${ip}\r\n` +
       `s=ohos-ipcam cam${cam}\r\n` +
       `t=0 0\r\n` +
       `m=video 0 RTP/AVP ${PAYLOAD_TYPE}\r\n` +
       `a=rtpmap:${PAYLOAD_TYPE} H264/90000\r\n` +
       `a=fmtp:${PAYLOAD_TYPE} packetization-mode=1;${sprop}profile-level-id=${profile}\r\n` +
-      `a=control:rtsp://${ip}:${RTSP_PORT}/cam${cam}\r\n`;
+      `a=control:trackID=0\r\n`;
+    if (RtspServer.audioReady) {
+      /* 音频轨道:客户端经 SETUP trackID=1 协商接收(不 SETUP 则无音频),
+       * MPEG4-GENERIC AAC-hbr,config=1210 即 AAC-LC 44100 立体声 ASC */
+      sdp += `m=audio 0 RTP/AVP 97\r\n` +
+        `a=rtpmap:97 MPEG4-GENERIC/44100/2\r\n` +
+        `a=fmtp:97 streamtype=5;profile-level-id=1;mode=AAC-hbr;` +
+        `sizelength=13;indexlength=3;indexdeltalength=3;config=1210\r\n` +
+        `a=control:trackID=1\r\n`;
+    }
+    return sdp;
   }
 }

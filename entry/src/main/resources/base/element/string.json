@@ -15,6 +15,10 @@
     {
       "name": "camera_perm_reason",
       "value": "capture camera frames and stream them over the network"
+    },
+    {
+      "name": "mic_perm_reason",
+      "value": "录制环境音频并通过 RTSP/ONVIF 随视频一同推送"
     }
   ]
 }

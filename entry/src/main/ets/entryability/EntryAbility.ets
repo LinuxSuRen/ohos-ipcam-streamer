@@ -4,7 +4,7 @@ import Want from '@ohos.app.ability.Want';
 import window from '@ohos.window';
 import hilog from '@ohos.hilog';
 import { abilityAccessCtrl, Permissions } from '@kit.AbilityKit';
-import { setAbilityContext, setCameraGranted, initPersisted, setAppForeground } from './GlobalContext';
+import { setAbilityContext, setCameraGranted, setMicGranted, initPersisted, setAppForeground } from './GlobalContext';
 import { CrashGuard } from './CrashGuard';
 
 const DOMAIN = 0x0801;
@@ -50,11 +50,13 @@ export default class EntryAbility extends UIAbility {
   private async requestCameraPermission(): Promise<void> {
     try {
       const atManager = abilityAccessCtrl.createAtManager();
-      const perms: Array<Permissions> = ['ohos.permission.CAMERA'];
+      const perms: Array<Permissions> = ['ohos.permission.CAMERA', 'ohos.permission.MICROPHONE'];
       const result = await atManager.requestPermissionsFromUser(this.context, perms);
       const granted = result.authResults.length > 0 && result.authResults[0] === 0;
       setCameraGranted(granted);
-      hilog.info(DOMAIN, TAG, 'camera perm granted=%{public}s', String(granted));
+      const micOk = result.authResults.length > 1 && result.authResults[1] === 0;
+      setMicGranted(micOk);
+      hilog.info(DOMAIN, TAG, 'camera=%{public}s mic=%{public}s', String(granted), String(micOk));
     } catch (e) {
       hilog.error(DOMAIN, TAG, 'request perm failed: %{public}s', JSON.stringify(e));
     }

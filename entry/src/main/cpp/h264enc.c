@@ -19,11 +19,15 @@
 #include "napi/native_api.h"
 
 #include <multimedia/player_framework/native_avcodec_videoencoder.h>
+#include <multimedia/player_framework/native_avcodec_audioencoder.h>
 #include <multimedia/player_framework/native_avcodec_base.h>
 #include <multimedia/player_framework/native_avformat.h>
 #include <multimedia/player_framework/native_avbuffer.h>
+#include <multimedia/player_framework/native_avmemory.h>
 #include <native_image/native_image.h>
 #include <native_buffer/native_buffer.h>
+#include <ohaudio/native_audiocapturer.h>
+#include <ohaudio/native_audiostreambuilder.h>
 #include <hilog/log.h>
 
 #include <pthread.h>
@@ -448,6 +452,259 @@ static void nv12_to_rgba(const uint8_t *nv12, int w, int h, uint8_t *rgba)
     }
 }
 
+/* ---------- audio: mic → AAC-LC(可选,客户端经 RTSP SETUP 协商是否接收) ---------- */
+static OH_AudioCapturer *g_mic = NULL;
+static OH_AVCodec *g_aenc = NULL;
+static napi_threadsafe_function g_audio_tsfn = NULL;
+static pthread_mutex_t g_aiq_lock = PTHREAD_MUTEX_INITIALIZER;
+typedef struct {
+    uint32_t index;
+    OH_AVMemory *mem;
+} audio_in_slot_t;
+static audio_in_slot_t g_aiq[IQ_CAP];
+static int g_aiq_head = 0, g_aiq_tail = 0, g_aiq_count = 0;
+static volatile int g_audio_ok = 0;
+
+typedef struct {
+    uint8_t *data;
+    int32_t size;
+} audio_msg_t;
+
+static void audio_call_js(napi_env env, napi_value js_cb, void *context, void *data)
+{
+    audio_msg_t *msg = (audio_msg_t *)data;
+    napi_value undefined;
+    napi_get_undefined(env, &undefined);
+    if (msg->size > 0 && msg->data != NULL) {
+        void *ab_data = NULL;
+        napi_value ab = NULL;
+        if (napi_create_arraybuffer(env, msg->size, &ab_data, &ab) == napi_ok) {
+            memcpy(ab_data, msg->data, msg->size);
+            napi_value argv[1] = {ab};
+            napi_call_function(env, undefined, js_cb, 1, argv, NULL);
+        }
+    }
+    free(msg->data);
+    free(msg);
+}
+
+static void audio_on_error(OH_AVCodec *codec, int32_t error_code, void *user_data)
+{
+    LOGE("aac encoder error: %{public}d", error_code);
+}
+
+static void audio_on_stream_changed(OH_AVCodec *codec, OH_AVFormat *format, void *user_data)
+{
+}
+
+static void audio_on_need_input(OH_AVCodec *codec, uint32_t index, OH_AVMemory *data, void *user_data)
+{
+    pthread_mutex_lock(&g_aiq_lock);
+    if (g_aiq_count < IQ_CAP) {
+        g_aiq[g_aiq_tail].index = index;
+        g_aiq[g_aiq_tail].mem = data;
+        g_aiq_tail = (g_aiq_tail + 1) % IQ_CAP;
+        g_aiq_count++;
+    }
+    pthread_mutex_unlock(&g_aiq_lock);
+}
+
+static void audio_on_new_output(OH_AVCodec *codec, uint32_t index, OH_AVMemory *data,
+                                OH_AVCodecBufferAttr *attr, void *user_data)
+{
+    if (attr == NULL || attr->size <= 0 || data == NULL) {
+        OH_AudioEncoder_FreeOutputData(codec, index);
+        return;
+    }
+    uint8_t *src = OH_AVMemory_GetAddr(data);
+    audio_msg_t *msg = (audio_msg_t *)malloc(sizeof(audio_msg_t));
+    if (msg != NULL) {
+        msg->data = (uint8_t *)malloc((size_t)attr->size);
+        msg->size = attr->size;
+        if (msg->data != NULL && src != NULL) {
+            memcpy(msg->data, src, (size_t)attr->size);
+            if (g_audio_tsfn != NULL) {
+                napi_call_threadsafe_function(g_audio_tsfn, msg, napi_tsfn_blocking);
+            } else {
+                free(msg->data);
+                free(msg);
+            }
+        } else {
+            free(msg);
+        }
+    }
+    OH_AudioEncoder_FreeOutputData(codec, index);
+}
+
+/* OHAudio 实时读回调:PCM 拷入编码器输入缓冲(不可阻塞) */
+static int32_t audio_on_read(OH_AudioCapturer *capturer, void *userData, void *buffer, int32_t size)
+{
+    if (!g_audio_ok) {
+        return 0;
+    }
+    pthread_mutex_lock(&g_aiq_lock);
+    if (g_aiq_count > 0 && g_aenc != NULL) {
+        uint32_t index = g_aiq[g_aiq_head].index;
+        OH_AVMemory *in = g_aiq[g_aiq_head].mem;
+        g_aiq_head = (g_aiq_head + 1) % IQ_CAP;
+        g_aiq_count--;
+        pthread_mutex_unlock(&g_aiq_lock);
+        uint8_t *dst = in != NULL ? OH_AVMemory_GetAddr(in) : NULL;
+        int32_t cap = in != NULL ? OH_AVMemory_GetSize(in) : 0;
+        if (dst != NULL && cap >= size) {
+            memcpy(dst, buffer, (size_t)size);
+            OH_AVCodecBufferAttr attr = {
+                .pts = 0,
+                .size = size,
+                .offset = 0,
+                .flags = AVCODEC_BUFFER_FLAGS_NONE,
+            };
+            OH_AudioEncoder_PushInputData(g_aenc, index, attr);
+        }
+        return 0;
+    }
+    pthread_mutex_unlock(&g_aiq_lock);
+    return 0;
+}
+
+static napi_value native_set_audio_callback(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+    if (argc < 1) {
+        napi_throw_error(env, NULL, "callback required");
+        return NULL;
+    }
+    napi_value resource_name;
+    napi_create_string_utf8(env, "h264enc_acb", NAPI_AUTO_LENGTH, &resource_name);
+    if (g_audio_tsfn != NULL) {
+        napi_release_threadsafe_function(g_audio_tsfn, napi_tsfn_release);
+        g_audio_tsfn = NULL;
+    }
+    napi_create_threadsafe_function(env, argv[0], NULL, resource_name, 0, 1,
+                                    NULL, NULL, NULL, audio_call_js, &g_audio_tsfn);
+    napi_value result;
+    napi_get_undefined(env, &result);
+    return result;
+}
+
+static void audio_teardown(void)
+{
+    g_audio_ok = 0;
+    if (g_mic != NULL) {
+        OH_AudioCapturer_Stop(g_mic);
+        OH_AudioCapturer_Release(g_mic);
+        g_mic = NULL;
+    }
+    if (g_aenc != NULL) {
+        OH_AudioEncoder_Stop(g_aenc);
+        OH_AudioEncoder_Destroy(g_aenc);
+        g_aenc = NULL;
+    }
+    pthread_mutex_lock(&g_aiq_lock);
+    g_aiq_head = g_aiq_tail = g_aiq_count = 0;
+    pthread_mutex_unlock(&g_aiq_lock);
+}
+
+/** 启动麦克风采集 + AAC-LC 编码(44100/立体声/64kbps)。
+ *  失败返回 0(视频照常,SDP/ONVIF 不带音频)。 */
+static napi_value native_start_audio(napi_env env, napi_callback_info info)
+{
+    (void)info;
+    if (g_audio_ok) {
+        napi_value r;
+        napi_create_int32(env, 1, &r);
+        return r;
+    }
+    do {
+        OH_AudioStreamBuilder *builder = NULL;
+        if (OH_AudioStreamBuilder_Create(&builder, AUDIOSTREAM_TYPE_CAPTURER) != AUDIOSTREAM_SUCCESS) {
+            LOGE("audio builder create failed");
+            break;
+        }
+        OH_AudioStreamBuilder_SetSamplingRate(builder, 44100);
+        OH_AudioStreamBuilder_SetChannelCount(builder, 2);
+        OH_AudioStreamBuilder_SetSampleFormat(builder, AUDIOSTREAM_SAMPLE_S16LE);
+        struct OH_AudioCapturer_Callbacks_Struct cbs;
+        memset(&cbs, 0, sizeof(cbs));
+        cbs.OH_AudioCapturer_OnReadData = audio_on_read;
+        OH_AudioStreamBuilder_SetCapturerCallback(builder, cbs, NULL);
+        OH_AudioCapturer *mic = NULL;
+        if (OH_AudioStreamBuilder_GenerateCapturer(builder, &mic) != AUDIOSTREAM_SUCCESS || mic == NULL) {
+            LOGE("generate capturer failed");
+            OH_AudioStreamBuilder_Destroy(builder);
+            break;
+        }
+        OH_AudioStreamBuilder_Destroy(builder);
+        g_mic = mic;
+
+        OH_AVCodec *enc = OH_AudioEncoder_CreateByMime("audio/aac");
+        if (enc == NULL) {
+            LOGE("aac CreateByMime failed, try CreateByName(avenc_aac)");
+            enc = OH_AudioEncoder_CreateByName("avenc_aac");
+        }
+        if (enc == NULL) {
+            LOGE("create aac encoder failed (mime+name)");
+            break;
+        }
+        /* 音频编码器仅提供 legacy 回调(AVMemory 型),写入用 OH_AVMemory_GetAddr,
+         * 提交用新式 PushInputData(index+attr),两者混用为官方示例做法 */
+        OH_AVCodecAsyncCallback cb = {
+            .onError = audio_on_error,
+            .onStreamChanged = audio_on_stream_changed,
+            .onNeedInputData = audio_on_need_input,
+            .onNeedOutputData = audio_on_new_output,
+        };
+        if (OH_AudioEncoder_SetCallback(enc, cb, NULL) != AV_ERR_OK) {
+            OH_AudioEncoder_Destroy(enc);
+            break;
+        }
+        OH_AVFormat *fmt = OH_AVFormat_CreateAudioFormat("audio/aac", 44100, 2);
+        OH_AVFormat_SetIntValue(fmt, OH_MD_KEY_AUDIO_SAMPLE_FORMAT, SAMPLE_S16LE);
+        OH_AVFormat_SetLongValue(fmt, OH_MD_KEY_BITRATE, 64000);
+        OH_AVErrCode rc = OH_AudioEncoder_Configure(enc, fmt);
+        OH_AVFormat_Destroy(fmt);
+        if (rc != AV_ERR_OK) {
+            LOGE("aac configure failed rc=%{public}d", rc);
+            OH_AudioEncoder_Destroy(enc);
+            break;
+        }
+        if (OH_AudioEncoder_Start(enc) != AV_ERR_OK) {
+            LOGE("aac start failed");
+            OH_AudioEncoder_Destroy(enc);
+            break;
+        }
+        g_aenc = enc;
+        if (OH_AudioCapturer_Start(g_mic) != AUDIOSTREAM_SUCCESS) {
+            LOGE("mic start failed");
+            break;
+        }
+        g_audio_ok = 1;
+        LOGI("audio pipeline started (44100/2ch aac 64kbps)");
+    } while (0);
+    if (!g_audio_ok) {
+        audio_teardown();
+    }
+    napi_value r;
+    napi_create_int32(env, g_audio_ok, &r);
+    return r;
+}
+
+static napi_value native_stop_audio(napi_env env, napi_callback_info info)
+{
+    (void)info;
+    audio_teardown();
+    if (g_audio_tsfn != NULL) {
+        napi_release_threadsafe_function(g_audio_tsfn, napi_tsfn_release);
+        g_audio_tsfn = NULL;
+    }
+    LOGI("audio pipeline stopped");
+    napi_value result;
+    napi_get_undefined(env, &result);
+    return result;
+}
+
 /* ---------- napi wrappers ---------- */
 static napi_value native_create_capture(napi_env env, napi_callback_info info)
 {
@@ -825,6 +1082,9 @@ static napi_value init(napi_env env, napi_value exports)
         {"snapshotWidth", NULL, native_snapshot_width, NULL, NULL, NULL, napi_default, NULL},
         {"snapshotHeight", NULL, native_snapshot_height, NULL, NULL, NULL, napi_default, NULL},
         {"takeSnapshotRgba", NULL, native_take_snapshot_rgba, NULL, NULL, NULL, napi_default, NULL},
+        {"setAudioCallback", NULL, native_set_audio_callback, NULL, NULL, NULL, napi_default, NULL},
+        {"startAudio", NULL, native_start_audio, NULL, NULL, NULL, napi_default, NULL},
+        {"stopAudio", NULL, native_stop_audio, NULL, NULL, NULL, napi_default, NULL},
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
     return exports;

@@ -9,7 +9,7 @@ import { RtspServer } from '../rtsp/RtspServer';
 import { OnvifServer } from '../onvif/OnvifServer';
 import { BackgroundKeeper } from '../background/BackgroundKeeper';
 import { CrashGuard } from '../entryability/CrashGuard';
-import { getAbilityContext, isCameraGranted, isAppForeground } from '../entryability/GlobalContext';
+import { getAbilityContext, isCameraGranted, isMicGranted, isAppForeground } from '../entryability/GlobalContext';
 import { loadSettings, saveSettings } from '../entryability/PersistStore';
 import { refreshLanAddress } from '../net/NetUtil';
 import hilog from '@ohos.hilog';
@@ -138,6 +138,13 @@ struct Index {
       await OnvifServer.start(getAbilityContext()!);
       await HttpServer.start();
 
+      /* 音频管线(可选):麦克风 → AAC,失败仅降级为纯视频 */
+      H264Encoder.setAudioListener((frame) => {
+        RtspServer.broadcastAudio(frame);
+      });
+      const audioOk = isMicGranted() && H264Encoder.startAudioPipeline();
+      RtspServer.setAudioEnabled(audioOk);
+
       /* 阶段二:全部编码器实例常驻启动,再尽量并发打开全部相机 */
       this.status = '启动编码器';
       const encPipelines = CameraSource.startEncoders(WANT_FPS, WANT_BITRATE);
@@ -159,7 +166,8 @@ struct Index {
         }
       }
       CamRegistry.set(this.camInfos);
-      this.profileText = this.camInfos.map((c) => `${c.label} ${c.outW}x${c.outH}`).join(' / ');
+      this.profileText = this.camInfos.map((c) => `${c.label} ${c.outW}x${c.outH}`).join(' / ') +
+        (audioOk ? ' +音频' : '');
 
       await BackgroundKeeper.start(getAbilityContext()!);
 
@@ -232,6 +240,8 @@ struct Index {
     FrameHub.removeSink(rtspSink);
     FrameHub.endDump();
     JpegSource.reset();
+    RtspServer.setAudioEnabled(false);
+    H264Encoder.stopAudioPipeline();
     await RtspServer.stop();
     await OnvifServer.stop();
     await HttpServer.stop();

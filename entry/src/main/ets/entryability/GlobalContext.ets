@@ -19,6 +19,16 @@ export function isCameraGranted(): boolean {
   return cameraGranted;
 }
 
+let micGranted = false;
+
+export function setMicGranted(granted: boolean): void {
+  micGranted = granted;
+}
+
+export function isMicGranted(): boolean {
+  return micGranted;
+}
+
 let appForeground = true;
 
 /** 前后台状态(EntryAbility onForeground/onBackground 维护)。
