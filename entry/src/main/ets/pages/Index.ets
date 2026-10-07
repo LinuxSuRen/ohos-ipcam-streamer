@@ -1,6 +1,7 @@
 import { CameraSource, CamPipeline } from '../camera/CameraSource';
 import { OrientationSensor } from '../camera/OrientationSensor';
 import { H264Encoder } from '../codec/H264Encoder';
+import { startSpeaker, stopSpeaker } from 'libh264enc.so';
 import { FrameHub, FrameSink } from '../net/FrameHub';
 import { CamRegistry, CamInfo } from '../net/CamRegistry';
 import { JpegSource } from '../net/JpegSource';
@@ -57,6 +58,8 @@ struct Index {
   @State suggestDeg: number = -1;
   @State crashText: string = '';
   @State audioText: string = '';
+  @State resolutions: string[] = [];
+  private curResolution: string = '1280x720';
   private audioOn: boolean = false;
   private timerId: number = -1;
   private curRotate: number = 0;
@@ -69,6 +72,7 @@ struct Index {
   aboutToAppear(): void {
     const st = loadSettings(getAbilityContext()!);
     this.curRotate = st.rotate;
+    this.curResolution = st.resolution;
     const crash = CrashGuard.consume(getAbilityContext()!);
     if (crash !== null) {
       this.crashText = crash.split('\n').slice(0, 2).join('\n');
@@ -97,7 +101,47 @@ struct Index {
       saveSettings(getAbilityContext()!, {
         rotate: deg,
         cam: -1,
-        autoStart: true
+        autoStart: true,
+        resolution: this.curResolution
+      });
+      await getAbilityContext()!.terminateSelf();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : JSON.stringify(e);
+      this.status = `切换失败: ${msg}`;
+    }
+  }
+
+  /** 当前选择分辨率解析出的期望宽高。 */
+  private wantDims(): number[] {
+    const want = this.curResolution.split('x').map((v: string): number => parseInt(v));
+    if (want.length === 2 && want[0] > 0 && want[1] > 0) {
+      return want;
+    }
+    return [WANT_WIDTH, WANT_HEIGHT];
+  }
+
+  /** 码率随分辨率面积缩放(720p 基准 4Mbps,上限 8Mbps),防止高分辨率低码率色度劣化。 */
+  private wantBitrate(): number {
+    const w = this.wantDims()[0];
+    const h = this.wantDims()[1];
+    return Math.min(8000000, Math.max(WANT_BITRATE,
+      Math.round(WANT_BITRATE * w * h / (WANT_WIDTH * WANT_HEIGHT))));
+  }
+
+  /**
+   * 分辨率切换:与方向切换同一模式(编码器不支持进程内二次配置),
+   * 保存配置 → 退出应用,重开后按新分辨率自动恢复推流。
+   */
+  private async switchResolution(res: string): Promise<void> {
+    if (!this.running || res === this.curResolution) {
+      return;
+    }
+    try {
+      saveSettings(getAbilityContext()!, {
+        rotate: this.curRotate,
+        cam: -1,
+        autoStart: true,
+        resolution: res
       });
       await getAbilityContext()!.terminateSelf();
     } catch (e) {
@@ -114,6 +158,9 @@ struct Index {
       this.status = '相机权限未授予,请到系统设置开启后重试';
       return;
     }
+    const wantW = this.wantDims()[0];
+    const wantH = this.wantDims()[1];
+    const bitrate = this.wantBitrate();
     try {
       await refreshLanAddress();
       H264Encoder.setListener((f) => {
@@ -129,7 +176,8 @@ struct Index {
       this.lastFrames = [0, 0, 0, 0];
       this.lastAdvanceAt = [0, 0, 0, 0];
       const pipelines: CamPipeline[] = CameraSource.prepare(
-        getAbilityContext()!, this.curRotate, WANT_WIDTH, WANT_HEIGHT);
+        getAbilityContext()!, this.curRotate, wantW, wantH);
+      this.resolutions = CameraSource.resolutions();
       if (pipelines.length === 0) {
         throw new Error('no camera available');
       }
@@ -149,17 +197,23 @@ struct Index {
         }
       });
       const audioLevel = isMicGranted() ? H264Encoder.startAudioPipeline() : 0;
+      /* 对讲回传扬声器(8kHz):随推流开启,回传 RTP 到达即播放 */
+      try {
+        startSpeaker();
+      } catch (e) {
+        hilog.warn(DOMAIN, TAG, 'speaker unavailable');
+      }
       const audioOk = audioLevel >= 2;
       RtspServer.setAudioEnabled(audioOk);
       RtspServer.setG711Enabled(audioLevel >= 1);
       this.audioOn = audioLevel >= 1;
-      this.audioText = audioLevel >= 2 ? 'AAC 48kHz 立体声 + G.711' :
+      this.audioText = audioLevel >= 2 ? 'AAC 48kHz 立体声 + G.711 + 对讲' :
         (audioLevel === 1 ? 'G.711(AAC 不可用)' :
           (isMicGranted() ? '不可用(启动失败,已降级纯视频)' : '未授权麦克风'));
 
       /* 阶段二:全部编码器实例常驻启动,再尽量并发打开全部相机 */
       this.status = '启动编码器';
-      const encPipelines = CameraSource.startEncoders(WANT_FPS, WANT_BITRATE);
+      const encPipelines = CameraSource.startEncoders(WANT_FPS, bitrate);
       if (encPipelines.length === 0) {
         throw new Error('no encoder started');
       }
@@ -172,7 +226,7 @@ struct Index {
         if (p !== undefined) {
           const info: CamInfo = {
             index: p.index, label: p.label, outW: p.outW, outH: p.outH,
-            fps: WANT_FPS, bitrate: WANT_BITRATE
+            fps: WANT_FPS, bitrate: bitrate
           };
           this.camInfos.push(info);
         }
@@ -190,7 +244,8 @@ struct Index {
       saveSettings(getAbilityContext()!, {
         rotate: this.curRotate,
         cam: -1,
-        autoStart: false
+        autoStart: false,
+        resolution: this.curResolution
       });
       this.timerId = setInterval(() => {
         const parts = this.camInfos.map((c) => `${c.label}=${FrameHub.fps(c.index)}fps`);
@@ -254,6 +309,10 @@ struct Index {
     RtspServer.setAudioEnabled(false);
     RtspServer.setG711Enabled(false);
     H264Encoder.stopAudioPipeline();
+    try {
+      stopSpeaker();
+    } catch (e) {
+    }
     await RtspServer.stop();
     await OnvifServer.stop();
     await HttpServer.stop();
@@ -285,11 +344,11 @@ struct Index {
     try {
       await CameraSource.stop();
       const prepared = CameraSource.prepare(
-        getAbilityContext()!, this.curRotate, WANT_WIDTH, WANT_HEIGHT);
+        getAbilityContext()!, this.curRotate, this.wantDims()[0], this.wantDims()[1]);
       if (prepared.length === 0) {
         throw new Error('prepare empty');
       }
-      const encPipelines = CameraSource.startEncoders(WANT_FPS, WANT_BITRATE);
+      const encPipelines = CameraSource.startEncoders(WANT_FPS, this.wantBitrate());
       if (encPipelines.length === 0) {
         throw new Error('no encoder started');
       }
@@ -300,7 +359,7 @@ struct Index {
         if (p !== undefined) {
           const info: CamInfo = {
             index: p.index, label: p.label, outW: p.outW, outH: p.outH,
-            fps: WANT_FPS, bitrate: WANT_BITRATE
+            fps: WANT_FPS, bitrate: this.wantBitrate()
           };
           this.camInfos.push(info);
         }
@@ -405,6 +464,18 @@ struct Index {
                 this.switchRotate(deg);
               })
           }, (deg: number) => deg.toString())
+          ForEach(this.resolutions, (res: string) => {
+            Text(res)
+              .fontSize(13)
+              .fontColor(this.curResolution === res ? '#0B1220' : '#C9A8FF')
+              .backgroundColor(this.curResolution === res ? '#C9A8FF' : '#1A2940')
+              .borderRadius(14)
+              .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+              .margin(4)
+              .onClick(() => {
+                this.switchResolution(res);
+              })
+          }, (res: string) => res)
         }
         .width('100%')
       }

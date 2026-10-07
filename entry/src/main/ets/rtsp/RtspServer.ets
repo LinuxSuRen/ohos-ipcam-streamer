@@ -222,6 +222,13 @@ export class RtspServer {
         `a=rtpmap:8 PCMA/8000/1\r\n` +
         `a=control:trackID=2\r\n`;
     }
+    /* 对讲回传通道:a=sendonly(G.711 PCMA,ONVIF backchannel 惯例,
+     * gortsplib 以 sendonly 识别回传轨);客户端 SETUP trackID=3 后
+     * 经 interleaved 通道 6 推 RTP,本端解码后从扬声器播放 */
+    sdp += `m=audio 0 RTP/AVP 8\r\n` +
+      `a=sendonly\r\n` +
+      `a=rtpmap:8 PCMA/8000/1\r\n` +
+      `a=control:trackID=3\r\n`;
     return sdp;
   }
 }

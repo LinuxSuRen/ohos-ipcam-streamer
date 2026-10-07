@@ -35,6 +35,13 @@ export class CameraSource {
   private static pipelines: CamPipeline[] = [];
   private static runtimes: CamRuntime[] = [];
   private static curRotate: number = 0;
+  /* 全部相机支持的分辨率档位(去重,"宽x高") */
+  private static resOptions: string[] = [];
+
+  /** 上次 prepare 发现的分辨率档位(供 UI 选择)。 */
+  static resolutions(): string[] {
+    return CameraSource.resOptions;
+  }
 
   static setRotate(deg: number): void {
     CameraSource.curRotate = deg;
@@ -71,9 +78,18 @@ export class CameraSource {
     const manager = camera.getCameraManager(context);
     const cams = manager.getSupportedCameras();
     const out: CamPipeline[] = [];
+    const resSet: Set<string> = new Set();
+    CameraSource.resOptions = [];
     for (let i = 0; i < cams.length && out.length < 4; i++) {
       try {
         const caps = manager.getSupportedOutputCapability(cams[i]);
+        for (const pf of caps.previewProfiles) {
+          const r = `${pf.size.width}x${pf.size.height}`;
+          if (pf.size.width >= 640 && pf.size.width % 16 === 0 &&
+              pf.size.height % 16 === 0 && !resSet.has(r)) {
+            resSet.add(r);
+          }
+        }
         const profile = CameraSource.pickProfile(caps.previewProfiles, wantW, wantH);
         if (profile === null) {
           continue;
@@ -95,6 +111,16 @@ export class CameraSource {
         hilog.warn(DOMAIN, TAG, 'prepare cam%{public}d failed: %{public}s', i, JSON.stringify(e));
       }
     }
+    const list: string[] = [];
+    for (const r of resSet) {
+      list.push(r);
+    }
+    list.sort((a: string, b: string): number => {
+      const pa = parseInt(a.split('x')[0]) * parseInt(a.split('x')[1]);
+      const pb = parseInt(b.split('x')[0]) * parseInt(b.split('x')[1]);
+      return pb - pa;
+    });
+    CameraSource.resOptions = list;
     CameraSource.pipelines = out;
     return out;
   }

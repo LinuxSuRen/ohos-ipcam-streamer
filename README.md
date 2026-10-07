@@ -36,6 +36,13 @@
 - 崩溃防护网:未捕获异常落盘,下次启动在应用界面与状态页展示
 - 纯 ArkTS 主体 + 单个 napi C 垫片(多相机多实例封装,~700 行)
 
+## 对讲回传(浏览器 → 手机扬声器)
+
+RTSP SDP 额外提供一条 `a=sendonly` 的 G.711 PCMA 回传轨(trackID=3,
+ONVIF backchannel 惯例,gortsplib 以 sendonly 识别):客户端 SETUP 该轨并经
+interleaved 通道 6 推送 RTP,手机端 A-law 解码后从扬声器实时播放(8kHz 单声道,
+环形缓冲 + 满则丢最旧保证实时)。onvif-ai 的"对讲/喊话"即走此通道。
+
 ## 后台运行说明(系统限制)
 
 - **熄屏 + 应用在前台**:双路持续推流(长时任务 DATA_TRANSFER 保持不冻结,实测不断流)
@@ -100,6 +107,8 @@ API 基线 5.0.0 (API 12);已实测 HarmonyOS 6.1.1 (API 24) 真机(SGT-AL50,前
 
 ## 已验证
 
+- 对讲回传端到端:自定义 RTSP 客户端向 trackID=3 推 8 秒 440Hz PCMA 音调,
+  手机端全部接收(400 包)并经扬声器播放
 - 音频端到端:ffmpeg 拉流解出 AAC 48000 立体声与 G.711(pcm_alaw 8000 单声道,
   电平实测正常);仅 SETUP 视频轨的客户端收不到任何音频包、仅 SETUP G.711 轨的
   客户端 0 AAC 包(协商生效);onvif-ai 联调自动选择 G.711 轨并在界面显示

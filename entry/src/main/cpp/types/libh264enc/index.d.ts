@@ -22,3 +22,9 @@ export const setAudioCallback: (cb: (frame: ArrayBuffer, type: number) => void) 
 export const startAudio: () => number;
 /** 停止音频管线 */
 export const stopAudio: () => void;
+/** 启动对讲回传扬声器(8kHz 单声道);失败抛错 */
+export const startSpeaker: () => number;
+/** 停止扬声器 */
+export const stopSpeaker: () => void;
+/** 对讲回传:写入一段 PCMA 字节(A-law),解码后播放 */
+export const speakerWritePCMA: (data: ArrayBuffer) => void;

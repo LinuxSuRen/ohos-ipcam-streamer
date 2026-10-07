@@ -3,6 +3,7 @@ import hilog from '@ohos.hilog';
 import { RtpPacketizer, splitAnnexB } from './RtpPacketizer';
 import { RtspServer, cameraOfUrl } from './RtspServer';
 import { CamRegistry } from '../net/CamRegistry';
+import { speakerWritePCMA } from 'libh264enc.so';
 
 const DOMAIN = 0x0806;
 const TAG = 'ipcam.RtspSession';
@@ -44,6 +45,7 @@ export class RtspSession {
   private camera: number = 0;
   private audioSetUp: boolean = false;
   private g711SetUp: boolean = false;
+  private backSetUp: boolean = false;
   private audioPkt: RtpPacketizer;
   private g711Pkt: RtpPacketizer;
   private audioSamples: number = 0;
@@ -66,6 +68,7 @@ export class RtspSession {
       this.buf += ab2str(info.message);
       this.tryParse();
     });
+    // 注:对讲回传的 RTP 以二进制 $ 帧混在控制连接上,tryParse 已做字节级识别
     this.conn.on('close', () => {
       this.dead = true;
       RtspServer.remove(this);
@@ -77,12 +80,77 @@ export class RtspSession {
   }
 
   private tryParse(): void {
+    /* 缓冲区头部若是 '$'(0x24)则为二进制 interleaved 帧(对讲回传),
+     * 字符串按 Latin-1 字节语义拼接,长度即字节数 */
+    while (this.buf.length > 0 && this.buf.charCodeAt(0) === 0x24) {
+      if (this.buf.length < 4) {
+        return;
+      }
+      const ch = this.buf.charCodeAt(1);
+      const len = (this.buf.charCodeAt(2) << 8) | this.buf.charCodeAt(3);
+      if (this.buf.length < 4 + len) {
+        return;
+      }
+      if (ch === 6) {
+        /* 回传通道 6 的 RTP:去 12 字节头后载荷为 PCMA */
+        const pkt = this.buf.substring(4, 4 + len);
+        this.onBackchannelRtp(pkt);
+      }
+      this.buf = this.buf.substring(4 + len);
+    }
     let idx = this.buf.indexOf('\r\n\r\n');
     while (idx >= 0) {
       const head = this.buf.substring(0, idx);
       this.buf = this.buf.substring(idx + 4);
       this.handleRequest(head);
+      /* 文本请求间也可能夹二进制帧 */
+      while (this.buf.length > 0 && this.buf.charCodeAt(0) === 0x24) {
+        if (this.buf.length < 4) {
+          return;
+        }
+        const ch2 = this.buf.charCodeAt(1);
+        const len2 = (this.buf.charCodeAt(2) << 8) | this.buf.charCodeAt(3);
+        if (this.buf.length < 4 + len2) {
+          return;
+        }
+        if (ch2 === 6) {
+          const pkt2 = this.buf.substring(4, 4 + len2);
+          this.onBackchannelRtp(pkt2);
+        }
+        this.buf = this.buf.substring(4 + len2);
+      }
       idx = this.buf.indexOf('\r\n\r\n');
+    }
+  }
+
+  /** 对讲回传 RTP(载荷 PCMA):RTP 头最小 12 字节,取载荷送扬声器。 */
+  private onBackchannelRtp(pkt: string): void {
+    if (!this.backSetUp || this.dead || pkt.length <= 12) {
+      return;
+    }
+    const cc = pkt.charCodeAt(0) & 0x0f;
+    const ext = (pkt.charCodeAt(0) & 0x10) !== 0;
+    let off = 12 + cc;
+    if (ext) {
+      if (pkt.length < off + 4) {
+        return;
+      }
+      const extWords = ((pkt.charCodeAt(off + 2) << 8) | pkt.charCodeAt(off + 3)) & 0xffff;
+      off += 4 + extWords * 4;
+    }
+    if (pkt.length <= off) {
+      return;
+    }
+    const payload = pkt.substring(off);
+    const ab = new ArrayBuffer(payload.length);
+    const u8 = new Uint8Array(ab);
+    for (let i = 0; i < payload.length; i++) {
+      u8[i] = payload.charCodeAt(i) & 0xff;
+    }
+    try {
+      speakerWritePCMA(ab);
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'speaker write failed');
     }
   }
 
@@ -137,7 +205,11 @@ export class RtspSession {
         }
         this.camera = cameraOfUrl(url);
         this.sessionUrl = url;
-        if (url.indexOf('trackID=2') >= 0) {
+        if (url.indexOf('trackID=3') >= 0) {
+          /* 对讲回传轨:客户端 SETUP 后经 interleaved 6 向本端推音频 */
+          this.backSetUp = true;
+          this.send(`RTSP/1.0 200 OK\r\nCSeq: ${cseq}\r\nSession: ${this.sessionId}\r\nTransport: RTP/AVP/TCP;interleaved=6-7;ssrc=1A2B3C4A\r\n\r\n`);
+        } else if (url.indexOf('trackID=2') >= 0) {
           /* G.711 音轨:客户端经 SETUP trackID=2 协商(interleaved 4-5) */
           this.g711SetUp = true;
           this.send(`RTSP/1.0 200 OK\r\nCSeq: ${cseq}\r\nSession: ${this.sessionId}\r\nTransport: RTP/AVP/TCP;interleaved=4-5;ssrc=1A2B3C4F\r\n\r\n`);

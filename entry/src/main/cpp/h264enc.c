@@ -27,6 +27,7 @@
 #include <native_image/native_image.h>
 #include <native_buffer/native_buffer.h>
 #include <ohaudio/native_audiocapturer.h>
+#include <ohaudio/native_audiorenderer.h>
 #include <ohaudio/native_audiostreambuilder.h>
 #include <hilog/log.h>
 
@@ -566,6 +567,138 @@ static void g711_feed(const int16_t *pcm, int32_t samples /* 每通道样本数 
             }
         }
     }
+}
+
+/* ---------- speaker:对讲回传(RTP PCMA → A-law 解码 → 扬声器) ---------- */
+static OH_AudioRenderer *g_spk = NULL;
+
+/* ITU-T G.711 A-law 解码(段基+符号位重建线性 PCM) */
+static int16_t alaw2linear(uint8_t a_val)
+{
+    int16_t t, seg;
+    a_val ^= 0x55;
+    t = (a_val & 0x0F) << 4;
+    seg = ((unsigned)a_val & 0x70) >> 4;
+    switch (seg) {
+    case 0: t += 8; break;
+    case 1: t += 0x108; break;
+    default: t += 0x108; t <<= seg - 1;
+    }
+    return (a_val & 0x80) ? t : -t;
+}
+
+/* 回传 PCMA 环形缓冲(字节);renderer 实时回调从其中取数据 */
+#define SPK_RING (16 * 1024)
+static uint8_t g_spk_ring[SPK_RING];
+static volatile int g_spk_head = 0; /* 写入位置 */
+static volatile int g_spk_tail = 0; /* 读取位置 */
+
+static OH_AudioData_Callback_Result spk_on_write(OH_AudioRenderer *renderer, void *userData,
+                                                 void *audioData, int32_t audioDataSize)
+{
+    (void)renderer;
+    (void)userData;
+    int16_t *out = (int16_t *)audioData;
+    const int want = audioDataSize / 2; /* 样本数(单声道) */
+    for (int i = 0; i < want; i++) {
+        if (g_spk_head == g_spk_tail) {
+            /* 无数据:输出静音 */
+            out[i] = 0;
+        } else {
+            out[i] = alaw2linear(g_spk_ring[g_spk_tail]);
+            g_spk_tail = (g_spk_tail + 1) % SPK_RING;
+        }
+    }
+    return AUDIO_DATA_CALLBACK_RESULT_VALID;
+}
+
+static napi_value native_start_speaker(napi_env env, napi_callback_info info)
+{
+    (void)info;
+    if (g_spk != NULL) {
+        napi_value r;
+        napi_create_int32(env, 1, &r);
+        return r;
+    }
+    OH_AudioStreamBuilder *builder = NULL;
+    if (OH_AudioStreamBuilder_Create(&builder, AUDIOSTREAM_TYPE_RENDERER) != AUDIOSTREAM_SUCCESS) {
+        napi_throw_error(env, NULL, "speaker builder failed");
+        return NULL;
+    }
+    OH_AudioStreamBuilder_SetSamplingRate(builder, 8000);
+    OH_AudioStreamBuilder_SetChannelCount(builder, 1);
+    OH_AudioStreamBuilder_SetSampleFormat(builder, AUDIOSTREAM_SAMPLE_S16LE);
+    OH_AudioStreamBuilder_SetRendererWriteDataCallback(builder, spk_on_write, NULL);
+    OH_AudioRenderer *spk = NULL;
+    if (OH_AudioStreamBuilder_GenerateRenderer(builder, &spk) != AUDIOSTREAM_SUCCESS || spk == NULL) {
+        OH_AudioStreamBuilder_Destroy(builder);
+        napi_throw_error(env, NULL, "speaker generate failed");
+        return NULL;
+    }
+    OH_AudioStreamBuilder_Destroy(builder);
+    if (OH_AudioRenderer_Start(spk) != AUDIOSTREAM_SUCCESS) {
+        OH_AudioRenderer_Release(spk);
+        napi_throw_error(env, NULL, "speaker start failed");
+        return NULL;
+    }
+    g_spk_head = g_spk_tail = 0;
+    g_spk = spk;
+    LOGI("speaker started (8000/1ch, backchannel)");
+    napi_value r;
+    napi_create_int32(env, 1, &r);
+    return r;
+}
+
+static napi_value native_stop_speaker(napi_env env, napi_callback_info info)
+{
+    (void)info;
+    if (g_spk != NULL) {
+        OH_AudioRenderer_Stop(g_spk);
+        OH_AudioRenderer_Release(g_spk);
+        g_spk = NULL;
+        LOGI("speaker stopped");
+    }
+    napi_value result;
+    napi_get_undefined(env, &result);
+    return result;
+}
+
+/** 对讲回传:写入一段 PCMA 字节(RTP 载荷),A-law 解码后播放。 */
+static napi_value native_speaker_write_pcma(napi_env env, napi_callback_info info)
+{
+    size_t argc = 1;
+    napi_value argv[1];
+    napi_get_cb_info(env, info, &argc, argv, NULL, NULL);
+    if (argc < 1 || g_spk == NULL) {
+        napi_value result;
+        napi_get_undefined(env, &result);
+        return result;
+    }
+    void *data = NULL;
+    size_t len = 0;
+    if (napi_get_arraybuffer_info(env, argv[0], &data, &len) != napi_ok || data == NULL || len == 0) {
+        napi_value result;
+        napi_get_undefined(env, &result);
+        return result;
+    }
+    static int spk_pkts = 0;
+    spk_pkts++;
+    if (spk_pkts == 1 || spk_pkts % 250 == 0) {
+        LOGI("speaker pcma pkt #%{public}d (%{public}d bytes)", spk_pkts, (int)len);
+    }
+    const uint8_t *src = (const uint8_t *)data;
+    for (size_t i = 0; i < len; i++) {
+        const int next = (g_spk_head + 1) % SPK_RING;
+        if (next == g_spk_tail) {
+            /* 缓冲满:丢最旧,保证实时性 */
+            g_spk_tail = (g_spk_tail + 1) % SPK_RING;
+        }
+        g_spk_ring[g_spk_head] = src[i];
+        g_spk_head = next;
+    }
+    napi_value result;
+    napi_get_undefined(env, &result);
+    return result;
 }
 
 static void audio_call_js(napi_env env, napi_value js_cb, void *context, void *data)
@@ -1196,6 +1329,9 @@ static napi_value init(napi_env env, napi_value exports)
         {"setAudioCallback", NULL, native_set_audio_callback, NULL, NULL, NULL, napi_default, NULL},
         {"startAudio", NULL, native_start_audio, NULL, NULL, NULL, napi_default, NULL},
         {"stopAudio", NULL, native_stop_audio, NULL, NULL, NULL, napi_default, NULL},
+        {"startSpeaker", NULL, native_start_speaker, NULL, NULL, NULL, napi_default, NULL},
+        {"stopSpeaker", NULL, native_stop_speaker, NULL, NULL, NULL, napi_default, NULL},
+        {"speakerWritePCMA", NULL, native_speaker_write_pcma, NULL, NULL, NULL, napi_default, NULL},
     };
     napi_define_properties(env, exports, sizeof(desc) / sizeof(desc[0]), desc);
     return exports;
