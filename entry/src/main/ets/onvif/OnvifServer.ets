@@ -395,7 +395,12 @@ export class OnvifServer {
       return `<tptz:GetStatusResponse><tptz:PTZStatus>${zoom}<tt:MoveStatus><tt:PanTilt>IDLE</tt:PanTilt><tt:Zoom>IDLE</tt:Zoom></tt:MoveStatus><tt:Error>NO_ERROR</tt:Error></tptz:PTZStatus></tptz:GetStatusResponse>`;
     }
     if (op === 'GetConfigurationOptions') {
-      const has = PtzController.hasZoom(cam);
+      /* 该命令用 ConfigurationToken(ptz_N,对应 profile_N);若请求带的是
+       * ProfileToken 也能正确提取,两者都兼容 */
+      const cfgToken = extract(body, 'ConfigurationToken>([^<]+)<');
+      const cfgCam = OnvifServer.cameraOfToken(cfgToken);
+      const cam2 = cfgToken !== '' ? cfgCam : cam;
+      const has = PtzController.hasZoom(cam2);
       let zoomSpaces = '';
       if (has) {
         zoomSpaces =
@@ -404,7 +409,7 @@ export class OnvifServer {
         '<tt:RelativeZoomTranslationSpace><tt:XRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:XRange><tt:URI>http://www.onvif.org/ver10/tptz/ZoomSpaces/RelativeZoomGenericSpace</tt:URI></tt:RelativeZoomTranslationSpace>' +
         '<tt:ZoomSpeed><tt:XRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:XRange></tt:ZoomSpeed>';
         /* 自定义空间:真实倍率范围(客户端据此把归一位置换算成 "x 倍率" 展示) */
-        const range = CameraSource.getZoomRange(cam);
+        const range = CameraSource.getZoomRange(cam2);
         zoomSpaces += '<tt:AbsoluteZoomPositionSpace>' +
           `<tt:XRange><tt:Min>${range[0]}</tt:Min><tt:Max>${range[1]}</tt:Max></tt:XRange>` +
           '<tt:URI>http://www.linuxsuren.org/onvif/zoom/ratio</tt:URI></tt:AbsoluteZoomPositionSpace>';
