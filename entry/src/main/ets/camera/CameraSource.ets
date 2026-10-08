@@ -346,6 +346,64 @@ export class CameraSource {
     return { format: 1000, size: { width: p.profileW, height: p.profileH } } as camera.Profile;
   }
 
+  /** 指定相机的变焦倍率范围(不支持变焦时为 [1,1])。 */
+  static getZoomRange(cam: number): number[] {
+    for (const rt of CameraSource.runtimes) {
+      if (rt.index === cam) {
+        try {
+          const ps = rt.session as camera.PhotoSession;
+          const r = ps.getZoomRatioRange();
+          if (r !== undefined && r.length === 2 && r[1] >= r[0]) {
+            hilog.info(DOMAIN, TAG, 'cam%{public}d zoom range %{public}d-%{public}d/100',
+              cam, Math.round(r[0] * 100), Math.round(r[1] * 100));
+            return r;
+          }
+        } catch (e) {
+          hilog.warn(DOMAIN, TAG, 'cam%{public}d getZoomRange failed', cam);
+        }
+      }
+    }
+    return [1, 1];
+  }
+
+  /** 设置变焦倍率(钳位到支持范围);返回实际生效值,不支持返回 -1。 */
+  static setZoom(cam: number, ratio: number): number {
+    for (const rt of CameraSource.runtimes) {
+      if (rt.index === cam) {
+        try {
+          const ps = rt.session as camera.PhotoSession;
+          const r = ps.getZoomRatioRange();
+          if (r === undefined || r.length !== 2 || r[1] <= r[0]) {
+            return -1;
+          }
+          const v = Math.min(r[1], Math.max(r[0], ratio));
+          ps.setZoomRatio(v);
+          hilog.info(DOMAIN, TAG, 'cam%{public}d setZoom %{public}d/100 (range %{public}d-%{public}d/100)',
+            cam, Math.round(v * 100), Math.round(r[0] * 100), Math.round(r[1] * 100));
+          return v;
+        } catch (e) {
+          hilog.warn(DOMAIN, TAG, 'cam%{public}d setZoom failed', cam);
+          return -1;
+        }
+      }
+    }
+    return -1;
+  }
+
+  /** 当前变焦倍率;未知返回 -1。 */
+  static getZoom(cam: number): number {
+    for (const rt of CameraSource.runtimes) {
+      if (rt.index === cam) {
+        try {
+          return (rt.session as camera.PhotoSession).getZoomRatio();
+        } catch (e) {
+          return -1;
+        }
+      }
+    }
+    return -1;
+  }
+
   static async stop(): Promise<void> {
     for (const rt of CameraSource.runtimes.slice()) {
       await CameraSource.closeRuntime(rt);

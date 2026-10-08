@@ -36,6 +36,15 @@
 - 崩溃防护网:未捕获异常落盘,下次启动在应用界面与状态页展示
 - 纯 ArkTS 主体 + 单个 napi C 垫片(多相机多实例封装,~700 行)
 
+## 变焦控制(ONVIF PTZ)
+
+ONVIF PTZ 服务(同一 SOAP 端口,`/onvif/ptz_service`)支持 Zoom 轴:
+`ContinuousMove`(速度 ±1,200ms 步进全范围 4%×v)、`AbsoluteMove`(位置 [0,1]
+线性映射 zoomRatio)、`RelativeMove`、`Stop`、`GetStatus`(归一位置)、
+`GetConfigurationOptions`(变焦范围上报)。实测后摄 0.55x–100x 变焦全程可用,
+推流画面随之平滑变化;前置按能力上报(无变焦则空 Zoom spaces)。
+Pan/Tilt 手机无可动部件,忽略并应答成功。
+
 ## 对讲回传(浏览器 → 手机扬声器)
 
 RTSP SDP 额外提供一条 `a=sendonly` 的 G.711 PCMA 回传轨(trackID=3,
