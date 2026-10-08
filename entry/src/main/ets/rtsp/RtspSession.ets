@@ -3,6 +3,7 @@ import hilog from '@ohos.hilog';
 import { RtpPacketizer, splitAnnexB } from './RtpPacketizer';
 import { RtspServer, cameraOfUrl } from './RtspServer';
 import { CamRegistry } from '../net/CamRegistry';
+import { speakerWritePCMA } from 'libh264enc.so';
 
 const DOMAIN = 0x0806;
 const TAG = 'ipcam.RtspSession';
@@ -42,6 +43,13 @@ export class RtspSession {
   private dead: boolean = false;
   private waitKey: boolean = true;
   private camera: number = 0;
+  private audioSetUp: boolean = false;
+  private g711SetUp: boolean = false;
+  private backSetUp: boolean = false;
+  private audioPkt: RtpPacketizer;
+  private g711Pkt: RtpPacketizer;
+  private audioSamples: number = 0;
+  private g711Samples: number = 0;
   private epoch: number = 0;
   private lastTs: number = -1;
   private sendChain: Promise<void> = Promise.resolve();
@@ -50,6 +58,8 @@ export class RtspSession {
     this.conn = conn;
     this.fps = fps > 0 ? fps : 25;
     this.packetizer = new RtpPacketizer();
+    this.audioPkt = new RtpPacketizer();
+    this.g711Pkt = new RtpPacketizer();
     this.sessionId = String(Math.floor(Math.random() * 900000) + 100000);
   }
 
@@ -58,6 +68,7 @@ export class RtspSession {
       this.buf += ab2str(info.message);
       this.tryParse();
     });
+    // 注:对讲回传的 RTP 以二进制 $ 帧混在控制连接上,tryParse 已做字节级识别
     this.conn.on('close', () => {
       this.dead = true;
       RtspServer.remove(this);
@@ -69,12 +80,77 @@ export class RtspSession {
   }
 
   private tryParse(): void {
+    /* 缓冲区头部若是 '$'(0x24)则为二进制 interleaved 帧(对讲回传),
+     * 字符串按 Latin-1 字节语义拼接,长度即字节数 */
+    while (this.buf.length > 0 && this.buf.charCodeAt(0) === 0x24) {
+      if (this.buf.length < 4) {
+        return;
+      }
+      const ch = this.buf.charCodeAt(1);
+      const len = (this.buf.charCodeAt(2) << 8) | this.buf.charCodeAt(3);
+      if (this.buf.length < 4 + len) {
+        return;
+      }
+      if (ch === 6) {
+        /* 回传通道 6 的 RTP:去 12 字节头后载荷为 PCMA */
+        const pkt = this.buf.substring(4, 4 + len);
+        this.onBackchannelRtp(pkt);
+      }
+      this.buf = this.buf.substring(4 + len);
+    }
     let idx = this.buf.indexOf('\r\n\r\n');
     while (idx >= 0) {
       const head = this.buf.substring(0, idx);
       this.buf = this.buf.substring(idx + 4);
       this.handleRequest(head);
+      /* 文本请求间也可能夹二进制帧 */
+      while (this.buf.length > 0 && this.buf.charCodeAt(0) === 0x24) {
+        if (this.buf.length < 4) {
+          return;
+        }
+        const ch2 = this.buf.charCodeAt(1);
+        const len2 = (this.buf.charCodeAt(2) << 8) | this.buf.charCodeAt(3);
+        if (this.buf.length < 4 + len2) {
+          return;
+        }
+        if (ch2 === 6) {
+          const pkt2 = this.buf.substring(4, 4 + len2);
+          this.onBackchannelRtp(pkt2);
+        }
+        this.buf = this.buf.substring(4 + len2);
+      }
       idx = this.buf.indexOf('\r\n\r\n');
+    }
+  }
+
+  /** 对讲回传 RTP(载荷 PCMA):RTP 头最小 12 字节,取载荷送扬声器。 */
+  private onBackchannelRtp(pkt: string): void {
+    if (!this.backSetUp || this.dead || pkt.length <= 12) {
+      return;
+    }
+    const cc = pkt.charCodeAt(0) & 0x0f;
+    const ext = (pkt.charCodeAt(0) & 0x10) !== 0;
+    let off = 12 + cc;
+    if (ext) {
+      if (pkt.length < off + 4) {
+        return;
+      }
+      const extWords = ((pkt.charCodeAt(off + 2) << 8) | pkt.charCodeAt(off + 3)) & 0xffff;
+      off += 4 + extWords * 4;
+    }
+    if (pkt.length <= off) {
+      return;
+    }
+    const payload = pkt.substring(off);
+    const ab = new ArrayBuffer(payload.length);
+    const u8 = new Uint8Array(ab);
+    for (let i = 0; i < payload.length; i++) {
+      u8[i] = payload.charCodeAt(i) & 0xff;
+    }
+    try {
+      speakerWritePCMA(ab);
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'speaker write failed');
     }
   }
 
@@ -129,7 +205,21 @@ export class RtspSession {
         }
         this.camera = cameraOfUrl(url);
         this.sessionUrl = url;
-        this.send(`RTSP/1.0 200 OK\r\nCSeq: ${cseq}\r\nSession: ${this.sessionId}\r\nTransport: RTP/AVP/TCP;interleaved=0-1;ssrc=1A2B3C4D\r\n\r\n`);
+        if (url.indexOf('trackID=3') >= 0) {
+          /* 对讲回传轨:客户端 SETUP 后经 interleaved 6 向本端推音频 */
+          this.backSetUp = true;
+          this.send(`RTSP/1.0 200 OK\r\nCSeq: ${cseq}\r\nSession: ${this.sessionId}\r\nTransport: RTP/AVP/TCP;interleaved=6-7;ssrc=1A2B3C4A\r\n\r\n`);
+        } else if (url.indexOf('trackID=2') >= 0) {
+          /* G.711 音轨:客户端经 SETUP trackID=2 协商(interleaved 4-5) */
+          this.g711SetUp = true;
+          this.send(`RTSP/1.0 200 OK\r\nCSeq: ${cseq}\r\nSession: ${this.sessionId}\r\nTransport: RTP/AVP/TCP;interleaved=4-5;ssrc=1A2B3C4F\r\n\r\n`);
+        } else if (url.indexOf('trackID=1') >= 0) {
+          /* AAC 音轨:客户端经 SETUP 协商后才接收音频(interleaved 2-3) */
+          this.audioSetUp = true;
+          this.send(`RTSP/1.0 200 OK\r\nCSeq: ${cseq}\r\nSession: ${this.sessionId}\r\nTransport: RTP/AVP/TCP;interleaved=2-3;ssrc=1A2B3C4E\r\n\r\n`);
+        } else {
+          this.send(`RTSP/1.0 200 OK\r\nCSeq: ${cseq}\r\nSession: ${this.sessionId}\r\nTransport: RTP/AVP/TCP;interleaved=0-1;ssrc=1A2B3C4D\r\n\r\n`);
+        }
         break;
       }
       case 'PLAY':
@@ -185,6 +275,64 @@ export class RtspSession {
         this.sendInterleaved(p);
       }
     }
+  }
+
+  /** 音频帧(AAC 裸帧,每 AU 1024 样本)→ RFC 3640 MPEG4-GENERIC RTP。
+   * 只发给经 SETUP trackID=1 协商过音频的会话(interleaved 通道 2)。 */
+  onAudioFrame(frame: ArrayBuffer): void {
+    if (!this.playing || !this.audioSetUp || this.dead) {
+      return;
+    }
+    const aac = new Uint8Array(frame);
+    if (aac.length <= 0 || aac.length >= 8192) {
+      return;
+    }
+    this.audioSamples += 1024;
+    const pkt = new Uint8Array(12 + 2 + 2 + aac.length);
+    /* RTP 头:PT=97,marker=1;时间戳为样本单位(44100Hz 时钟) */
+    this.audioPkt.fillAudio(pkt, this.audioSamples & 0xffffffff, 97);
+    /* AU-headers-length = 16(bit) */
+    pkt[12] = 0x00;
+    pkt[13] = 0x10;
+    /* AU header:13 bit 大小 + 3 bit index = size<<3 */
+    const au = aac.length << 3;
+    pkt[14] = (au >> 8) & 0xff;
+    pkt[15] = au & 0xff;
+    pkt.set(aac, 16);
+    const out = new Uint8Array(4 + pkt.length);
+    out[0] = 0x24;
+    out[1] = 2;
+    out[2] = (pkt.length >> 8) & 0xff;
+    out[3] = pkt.length & 0xff;
+    out.set(pkt, 4);
+    const ab: ArrayBuffer = new ArrayBuffer(out.length);
+    new Uint8Array(ab).set(out);
+    this.sendRaw(ab);
+  }
+
+  /** G.711 PCMA 帧(160 字节 = 20ms)→ RTP(PT 8,8kHz 样本时钟)。
+   * 只发给经 SETUP trackID=2 协商过 G.711 的会话(interleaved 通道 4)。 */
+  onG711Frame(frame: ArrayBuffer): void {
+    if (!this.playing || !this.g711SetUp || this.dead) {
+      return;
+    }
+    const pcma = new Uint8Array(frame);
+    if (pcma.length <= 0 || pcma.length > 1024) {
+      return;
+    }
+    this.g711Samples += pcma.length; /* 1 字节 = 1 样本(8kHz) */
+    const pkt = new Uint8Array(12 + pcma.length);
+    this.g711Pkt.fillAudio(pkt, this.g711Samples & 0xffffffff, 8);
+    pkt.set(pcma, 12);
+    const out = new Uint8Array(4 + pkt.length);
+    out[0] = 0x24;
+    out[1] = 4;
+    out[2] = (pkt.length >> 8) & 0xff;
+    out[3] = pkt.length & 0xff;
+    out.set(pkt, 4);
+    const ab: ArrayBuffer = new ArrayBuffer(out.length);
+    new Uint8Array(ab).set(out);
+    this.sendRaw(ab);
   }
 
   /** ts 跟随真实时钟,实际帧率与配置不符时播放速度仍正确;

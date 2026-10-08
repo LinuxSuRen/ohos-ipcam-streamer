@@ -77,6 +77,24 @@ export class RtspServer {
   private static server: socket.TCPSocketServer | null = null;
   private static sessions: RtspSession[] = [];
   private static fps: number = 25;
+  private static audioReady: boolean = false;
+  private static g711Ready: boolean = false;
+
+  static setAudioEnabled(enabled: boolean): void {
+    RtspServer.audioReady = enabled;
+  }
+
+  static isAudioEnabled(): boolean {
+    return RtspServer.audioReady;
+  }
+
+  static setG711Enabled(enabled: boolean): void {
+    RtspServer.g711Ready = enabled;
+  }
+
+  static isG711Enabled(): boolean {
+    return RtspServer.g711Ready;
+  }
 
   static async start(fps: number): Promise<void> {
     if (RtspServer.server !== null) {
@@ -132,6 +150,26 @@ export class RtspServer {
     }
   }
 
+  /** 音频帧分发(AAC 裸帧):只投给经 SETUP 协商了音频轨道(trackID=1)的会话。 */
+  static broadcastAudio(frame: ArrayBuffer): void {
+    if (!RtspServer.audioReady) {
+      return;
+    }
+    for (const s of RtspServer.sessions) {
+      s.onAudioFrame(frame);
+    }
+  }
+
+  /** G.711 PCMA 帧分发:只投给经 SETUP trackID=2 协商的会话。 */
+  static broadcastG711(frame: ArrayBuffer): void {
+    if (!RtspServer.g711Ready) {
+      return;
+    }
+    for (const s of RtspServer.sessions) {
+      s.onG711Frame(frame);
+    }
+  }
+
   static remove(session: RtspSession): void {
     const i = RtspServer.sessions.indexOf(session);
     if (i >= 0) {
@@ -160,13 +198,37 @@ export class RtspServer {
         profile = hex(sps[1]) + hex(sps[2]) + hex(sps[3]);
       }
     }
-    return `v=0\r\n` +
+    let sdp = `v=0\r\n` +
       `o=- 0 0 IN IP4 ${ip}\r\n` +
       `s=ohos-ipcam cam${cam}\r\n` +
       `t=0 0\r\n` +
       `m=video 0 RTP/AVP ${PAYLOAD_TYPE}\r\n` +
       `a=rtpmap:${PAYLOAD_TYPE} H264/90000\r\n` +
       `a=fmtp:${PAYLOAD_TYPE} packetization-mode=1;${sprop}profile-level-id=${profile}\r\n` +
-      `a=control:rtsp://${ip}:${RTSP_PORT}/cam${cam}\r\n`;
+      `a=control:trackID=0\r\n`;
+    if (RtspServer.audioReady) {
+      /* AAC 音轨:客户端经 SETUP trackID=1 协商接收(不 SETUP 则无音频),
+       * MPEG4-GENERIC AAC-hbr,config=1190 即 AAC-LC 48000 立体声 ASC */
+      sdp += `m=audio 0 RTP/AVP 97\r\n` +
+        `a=rtpmap:97 MPEG4-GENERIC/48000/2\r\n` +
+        `a=fmtp:97 streamtype=5;profile-level-id=1;mode=AAC-hbr;` +
+        `sizelength=13;indexlength=3;indexdeltalength=3;config=1190\r\n` +
+        `a=control:trackID=1\r\n`;
+    }
+    if (RtspServer.g711Ready) {
+      /* G.711 A-law 音轨:ONVIF 生态事实标准,8kHz/单声道 20ms 一包,
+       * 静态载荷类型 8(PCMA);客户端经 SETUP trackID=2 协商接收 */
+      sdp += `m=audio 0 RTP/AVP 8\r\n` +
+        `a=rtpmap:8 PCMA/8000/1\r\n` +
+        `a=control:trackID=2\r\n`;
+    }
+    /* 对讲回传通道:a=sendonly(G.711 PCMA,ONVIF backchannel 惯例,
+     * gortsplib 以 sendonly 识别回传轨);客户端 SETUP trackID=3 后
+     * 经 interleaved 通道 6 推 RTP,本端解码后从扬声器播放 */
+    sdp += `m=audio 0 RTP/AVP 8\r\n` +
+      `a=sendonly\r\n` +
+      `a=rtpmap:8 PCMA/8000/1\r\n` +
+      `a=control:trackID=3\r\n`;
+    return sdp;
   }
 }

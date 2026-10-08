@@ -35,6 +35,13 @@ export class CameraSource {
   private static pipelines: CamPipeline[] = [];
   private static runtimes: CamRuntime[] = [];
   private static curRotate: number = 0;
+  /* 全部相机支持的分辨率档位(去重,"宽x高") */
+  private static resOptions: string[] = [];
+
+  /** 上次 prepare 发现的分辨率档位(供 UI 选择)。 */
+  static resolutions(): string[] {
+    return CameraSource.resOptions;
+  }
 
   static setRotate(deg: number): void {
     CameraSource.curRotate = deg;
@@ -71,9 +78,18 @@ export class CameraSource {
     const manager = camera.getCameraManager(context);
     const cams = manager.getSupportedCameras();
     const out: CamPipeline[] = [];
+    const resSet: Set<string> = new Set();
+    CameraSource.resOptions = [];
     for (let i = 0; i < cams.length && out.length < 4; i++) {
       try {
         const caps = manager.getSupportedOutputCapability(cams[i]);
+        for (const pf of caps.previewProfiles) {
+          const r = `${pf.size.width}x${pf.size.height}`;
+          if (pf.size.width >= 640 && pf.size.width % 16 === 0 &&
+              pf.size.height % 16 === 0 && !resSet.has(r)) {
+            resSet.add(r);
+          }
+        }
         const profile = CameraSource.pickProfile(caps.previewProfiles, wantW, wantH);
         if (profile === null) {
           continue;
@@ -95,6 +111,16 @@ export class CameraSource {
         hilog.warn(DOMAIN, TAG, 'prepare cam%{public}d failed: %{public}s', i, JSON.stringify(e));
       }
     }
+    const list: string[] = [];
+    for (const r of resSet) {
+      list.push(r);
+    }
+    list.sort((a: string, b: string): number => {
+      const pa = parseInt(a.split('x')[0]) * parseInt(a.split('x')[1]);
+      const pb = parseInt(b.split('x')[0]) * parseInt(b.split('x')[1]);
+      return pb - pa;
+    });
+    CameraSource.resOptions = list;
     CameraSource.pipelines = out;
     return out;
   }
@@ -202,24 +228,26 @@ export class CameraSource {
     if (i >= 0) {
       CameraSource.runtimes.splice(i, 1);
     }
-    /* 每步都加超时:HAL 个别调用不回调会卡死 */
+    /* 每步都加超时:HAL 个别调用不回调会卡死。深度休眠下 HAL 响应极慢,
+     * 超时太短、过早放弃会让设备停在半开状态(7400201 反复失败,
+     * 实测仅进程退出才能解除),故给到 8s。 */
     try {
-      await CameraSource.withTimeout(rt.session.stop(), 3000, 'session.stop');
+      await CameraSource.withTimeout(rt.session.stop(), 8000, 'session.stop');
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'session stop');
     }
     try {
-      await CameraSource.withTimeout(rt.session.release(), 3000, 'session.release');
+      await CameraSource.withTimeout(rt.session.release(), 8000, 'session.release');
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'session release');
     }
     try {
-      await CameraSource.withTimeout(rt.preview.release(), 3000, 'preview.release');
+      await CameraSource.withTimeout(rt.preview.release(), 8000, 'preview.release');
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'preview release');
     }
     try {
-      await CameraSource.withTimeout(rt.input.close(), 3000, 'input.close');
+      await CameraSource.withTimeout(rt.input.close(), 8000, 'input.close');
     } catch (e) {
       hilog.warn(DOMAIN, TAG, 'input close');
     }
@@ -316,6 +344,64 @@ export class CameraSource {
       return profile;
     }
     return { format: 1000, size: { width: p.profileW, height: p.profileH } } as camera.Profile;
+  }
+
+  /** 指定相机的变焦倍率范围(不支持变焦时为 [1,1])。 */
+  static getZoomRange(cam: number): number[] {
+    for (const rt of CameraSource.runtimes) {
+      if (rt.index === cam) {
+        try {
+          const ps = rt.session as camera.PhotoSession;
+          const r = ps.getZoomRatioRange();
+          if (r !== undefined && r.length === 2 && r[1] >= r[0]) {
+            hilog.info(DOMAIN, TAG, 'cam%{public}d zoom range %{public}d-%{public}d/100',
+              cam, Math.round(r[0] * 100), Math.round(r[1] * 100));
+            return r;
+          }
+        } catch (e) {
+          hilog.warn(DOMAIN, TAG, 'cam%{public}d getZoomRange failed', cam);
+        }
+      }
+    }
+    return [1, 1];
+  }
+
+  /** 设置变焦倍率(钳位到支持范围);返回实际生效值,不支持返回 -1。 */
+  static setZoom(cam: number, ratio: number): number {
+    for (const rt of CameraSource.runtimes) {
+      if (rt.index === cam) {
+        try {
+          const ps = rt.session as camera.PhotoSession;
+          const r = ps.getZoomRatioRange();
+          if (r === undefined || r.length !== 2 || r[1] <= r[0]) {
+            return -1;
+          }
+          const v = Math.min(r[1], Math.max(r[0], ratio));
+          ps.setZoomRatio(v);
+          hilog.info(DOMAIN, TAG, 'cam%{public}d setZoom %{public}d/100 (range %{public}d-%{public}d/100)',
+            cam, Math.round(v * 100), Math.round(r[0] * 100), Math.round(r[1] * 100));
+          return v;
+        } catch (e) {
+          hilog.warn(DOMAIN, TAG, 'cam%{public}d setZoom failed', cam);
+          return -1;
+        }
+      }
+    }
+    return -1;
+  }
+
+  /** 当前变焦倍率;未知返回 -1。 */
+  static getZoom(cam: number): number {
+    for (const rt of CameraSource.runtimes) {
+      if (rt.index === cam) {
+        try {
+          return (rt.session as camera.PhotoSession).getZoomRatio();
+        } catch (e) {
+          return -1;
+        }
+      }
+    }
+    return -1;
   }
 
   static async stop(): Promise<void> {

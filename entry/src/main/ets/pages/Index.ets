@@ -1,6 +1,7 @@
 import { CameraSource, CamPipeline } from '../camera/CameraSource';
 import { OrientationSensor } from '../camera/OrientationSensor';
 import { H264Encoder } from '../codec/H264Encoder';
+import { startSpeaker, stopSpeaker } from 'libh264enc.so';
 import { FrameHub, FrameSink } from '../net/FrameHub';
 import { CamRegistry, CamInfo } from '../net/CamRegistry';
 import { JpegSource } from '../net/JpegSource';
@@ -9,7 +10,7 @@ import { RtspServer } from '../rtsp/RtspServer';
 import { OnvifServer } from '../onvif/OnvifServer';
 import { BackgroundKeeper } from '../background/BackgroundKeeper';
 import { CrashGuard } from '../entryability/CrashGuard';
-import { getAbilityContext, isCameraGranted } from '../entryability/GlobalContext';
+import { getAbilityContext, isCameraGranted, isMicGranted, isAppForeground } from '../entryability/GlobalContext';
 import { loadSettings, saveSettings } from '../entryability/PersistStore';
 import { refreshLanAddress } from '../net/NetUtil';
 import hilog from '@ohos.hilog';
@@ -56,15 +57,22 @@ struct Index {
   @State httpUrl: string = '';
   @State suggestDeg: number = -1;
   @State crashText: string = '';
+  @State audioText: string = '';
+  @State resolutions: string[] = [];
+  private curResolution: string = '1280x720';
+  private audioOn: boolean = false;
   private timerId: number = -1;
   private curRotate: number = 0;
   private camInfos: CamInfo[] = [];
   private lastFrames: number[] = [0, 0, 0, 0];
   private lastAdvanceAt: number[] = [0, 0, 0, 0];
+  private stallCount: number[] = [0, 0, 0, 0];
+  private recovering: boolean = false;
 
   aboutToAppear(): void {
     const st = loadSettings(getAbilityContext()!);
     this.curRotate = st.rotate;
+    this.curResolution = st.resolution;
     const crash = CrashGuard.consume(getAbilityContext()!);
     if (crash !== null) {
       this.crashText = crash.split('\n').slice(0, 2).join('\n');
@@ -93,7 +101,47 @@ struct Index {
       saveSettings(getAbilityContext()!, {
         rotate: deg,
         cam: -1,
-        autoStart: true
+        autoStart: true,
+        resolution: this.curResolution
+      });
+      await getAbilityContext()!.terminateSelf();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : JSON.stringify(e);
+      this.status = `切换失败: ${msg}`;
+    }
+  }
+
+  /** 当前选择分辨率解析出的期望宽高。 */
+  private wantDims(): number[] {
+    const want = this.curResolution.split('x').map((v: string): number => parseInt(v));
+    if (want.length === 2 && want[0] > 0 && want[1] > 0) {
+      return want;
+    }
+    return [WANT_WIDTH, WANT_HEIGHT];
+  }
+
+  /** 码率随分辨率面积缩放(720p 基准 4Mbps,上限 8Mbps),防止高分辨率低码率色度劣化。 */
+  private wantBitrate(): number {
+    const w = this.wantDims()[0];
+    const h = this.wantDims()[1];
+    return Math.min(8000000, Math.max(WANT_BITRATE,
+      Math.round(WANT_BITRATE * w * h / (WANT_WIDTH * WANT_HEIGHT))));
+  }
+
+  /**
+   * 分辨率切换:与方向切换同一模式(编码器不支持进程内二次配置),
+   * 保存配置 → 退出应用,重开后按新分辨率自动恢复推流。
+   */
+  private async switchResolution(res: string): Promise<void> {
+    if (!this.running || res === this.curResolution) {
+      return;
+    }
+    try {
+      saveSettings(getAbilityContext()!, {
+        rotate: this.curRotate,
+        cam: -1,
+        autoStart: true,
+        resolution: res
       });
       await getAbilityContext()!.terminateSelf();
     } catch (e) {
@@ -110,6 +158,9 @@ struct Index {
       this.status = '相机权限未授予,请到系统设置开启后重试';
       return;
     }
+    const wantW = this.wantDims()[0];
+    const wantH = this.wantDims()[1];
+    const bitrate = this.wantBitrate();
     try {
       await refreshLanAddress();
       H264Encoder.setListener((f) => {
@@ -125,7 +176,8 @@ struct Index {
       this.lastFrames = [0, 0, 0, 0];
       this.lastAdvanceAt = [0, 0, 0, 0];
       const pipelines: CamPipeline[] = CameraSource.prepare(
-        getAbilityContext()!, this.curRotate, WANT_WIDTH, WANT_HEIGHT);
+        getAbilityContext()!, this.curRotate, wantW, wantH);
+      this.resolutions = CameraSource.resolutions();
       if (pipelines.length === 0) {
         throw new Error('no camera available');
       }
@@ -136,9 +188,32 @@ struct Index {
       await OnvifServer.start(getAbilityContext()!);
       await HttpServer.start();
 
+      /* 音频管线(可选):麦克风 → AAC + G.711 双编码,失败仅降级为纯视频 */
+      H264Encoder.setAudioListener((frame, type) => {
+        if (type === 1) {
+          RtspServer.broadcastG711(frame);
+        } else {
+          RtspServer.broadcastAudio(frame);
+        }
+      });
+      const audioLevel = isMicGranted() ? H264Encoder.startAudioPipeline() : 0;
+      /* 对讲回传扬声器(8kHz):随推流开启,回传 RTP 到达即播放 */
+      try {
+        startSpeaker();
+      } catch (e) {
+        hilog.warn(DOMAIN, TAG, 'speaker unavailable');
+      }
+      const audioOk = audioLevel >= 2;
+      RtspServer.setAudioEnabled(audioOk);
+      RtspServer.setG711Enabled(audioLevel >= 1);
+      this.audioOn = audioLevel >= 1;
+      this.audioText = audioLevel >= 2 ? 'AAC 48kHz 立体声 + G.711 + 对讲' :
+        (audioLevel === 1 ? 'G.711(AAC 不可用)' :
+          (isMicGranted() ? '不可用(启动失败,已降级纯视频)' : '未授权麦克风'));
+
       /* 阶段二:全部编码器实例常驻启动,再尽量并发打开全部相机 */
       this.status = '启动编码器';
-      const encPipelines = CameraSource.startEncoders(WANT_FPS, WANT_BITRATE);
+      const encPipelines = CameraSource.startEncoders(WANT_FPS, bitrate);
       if (encPipelines.length === 0) {
         throw new Error('no encoder started');
       }
@@ -151,7 +226,7 @@ struct Index {
         if (p !== undefined) {
           const info: CamInfo = {
             index: p.index, label: p.label, outW: p.outW, outH: p.outH,
-            fps: WANT_FPS, bitrate: WANT_BITRATE
+            fps: WANT_FPS, bitrate: bitrate
           };
           this.camInfos.push(info);
         }
@@ -169,22 +244,44 @@ struct Index {
       saveSettings(getAbilityContext()!, {
         rotate: this.curRotate,
         cam: -1,
-        autoStart: false
+        autoStart: false,
+        resolution: this.curResolution
       });
       this.timerId = setInterval(() => {
         const parts = this.camInfos.map((c) => `${c.label}=${FrameHub.fps(c.index)}fps`);
         this.stats = `${parts.join(' ')} RTSP客户端=${RtspServer.sessionCount()}`;
-        /* 帧停滞自愈:任一在推相机 6 秒无新帧(熄屏唤醒/HAL 卡死)则重开会话 */
+        /* 后台时系统拒绝相机会话(实测),不做无谓重试,避免 7400201 空转
+         * 与设备半开状态;回前台后由 foregroundJustNow 立即触发恢复 */
+        if (!isAppForeground()) {
+          if (this.status === '推流中') {
+            this.status = '后台暂停(回前台自动恢复)';
+          }
+          return;
+        }
+        if (this.status === '后台暂停(回前台自动恢复)') {
+          this.status = '推流中';
+          this.recoverCameras();
+        }
+        /* 帧停滞自愈分级:单次停滞仅重开该路会话;连续 3 次(≈18s)
+         * 仍无帧则全量重建相机管线(深度休眠后半开状态仅靠重开无法恢复) */
         const now = Date.now();
         for (const c of this.camInfos) {
           const fc = FrameHub.frameCount(c.index);
           if (fc > this.lastFrames[c.index]) {
             this.lastFrames[c.index] = fc;
             this.lastAdvanceAt[c.index] = now;
+            this.stallCount[c.index] = 0;
           } else if (now - this.lastAdvanceAt[c.index] > 6000 && this.lastAdvanceAt[c.index] > 0) {
             this.lastAdvanceAt[c.index] = now;
-            hilog.warn(DOMAIN, TAG, 'cam%{public}d frame stall, reopening', c.index);
-            CameraSource.reopen(getAbilityContext()!, c.index);
+            this.stallCount[c.index]++;
+            if (this.stallCount[c.index] >= 3) {
+              this.stallCount[c.index] = 0;
+              hilog.warn(DOMAIN, TAG, 'cam%{public}d repeated stall, full camera restart', c.index);
+              this.recoverCameras();
+            } else {
+              hilog.warn(DOMAIN, TAG, 'cam%{public}d frame stall, reopening', c.index);
+              CameraSource.reopen(getAbilityContext()!, c.index);
+            }
           }
         }
       }, 1000);
@@ -209,6 +306,13 @@ struct Index {
     FrameHub.removeSink(rtspSink);
     FrameHub.endDump();
     JpegSource.reset();
+    RtspServer.setAudioEnabled(false);
+    RtspServer.setG711Enabled(false);
+    H264Encoder.stopAudioPipeline();
+    try {
+      stopSpeaker();
+    } catch (e) {
+    }
     await RtspServer.stop();
     await OnvifServer.stop();
     await HttpServer.stop();
@@ -221,7 +325,91 @@ struct Index {
     }
     await this.cleanup();
     this.running = false;
+    this.audioOn = false;
+    this.audioText = '';
     this.status = '已停止';
+  }
+
+  /**
+   * 全量重建相机管线(采集面+编码器+会话):用于深度休眠后重开无效的场景。
+   * 与停止/再启动走同一套调用(实测该路径可多次重复执行)。
+   */
+  private async recoverCameras(): Promise<void> {
+    if (this.recovering || !this.running) {
+      return;
+    }
+    this.recovering = true;
+    const prevStatus = this.status;
+    this.status = '相机管线恢复中';
+    try {
+      await CameraSource.stop();
+      const prepared = CameraSource.prepare(
+        getAbilityContext()!, this.curRotate, this.wantDims()[0], this.wantDims()[1]);
+      if (prepared.length === 0) {
+        throw new Error('prepare empty');
+      }
+      const encPipelines = CameraSource.startEncoders(WANT_FPS, this.wantBitrate());
+      if (encPipelines.length === 0) {
+        throw new Error('no encoder started');
+      }
+      const started: number[] = await CameraSource.openAll(getAbilityContext()!);
+      this.camInfos = [];
+      for (const idx of started) {
+        const p = encPipelines.find((c) => c.index === idx);
+        if (p !== undefined) {
+          const info: CamInfo = {
+            index: p.index, label: p.label, outW: p.outW, outH: p.outH,
+            fps: WANT_FPS, bitrate: this.wantBitrate()
+          };
+          this.camInfos.push(info);
+        }
+      }
+      CamRegistry.set(this.camInfos);
+      this.profileText = this.camInfos.map((c) => `${c.label} ${c.outW}x${c.outH}`).join(' / ');
+      this.lastFrames = [0, 0, 0, 0];
+      this.lastAdvanceAt = [0, 0, 0, 0];
+      this.stallCount = [0, 0, 0, 0];
+      this.status = '推流中';
+      hilog.info(DOMAIN, TAG, 'camera pipeline recovered');
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : JSON.stringify(e);
+      hilog.error(DOMAIN, TAG, 'recover failed: %{public}s', msg);
+      this.status = `相机恢复失败: ${msg}`;
+      /* 下个停滞周期会再次尝试 */
+    } finally {
+      this.status = this.status === '相机管线恢复中' ? prevStatus : this.status;
+      this.recovering = false;
+    }
+  }
+
+  /**
+   * 「关闭」按钮:停止推流、结束长时任务(常驻通知消失)并退出应用。
+   * 这是唯一的退出入口;系统返回键只进后台,推流不中断。
+   */
+  private async doClose(): Promise<void> {
+    hilog.info(DOMAIN, TAG, 'user close');
+    if (this.running) {
+      await this.doStop();
+    }
+    try {
+      await BackgroundKeeper.stop(getAbilityContext()!);
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'stop background');
+    }
+    await getAbilityContext()!.terminateSelf();
+  }
+
+  /**
+   * 系统返回键:不退出,仅移入后台继续推流(返回 true 拦截默认行为)。
+   */
+  onBackPress(): boolean {
+    hilog.info(DOMAIN, TAG, 'back pressed, move to background');
+    try {
+      getAbilityContext()!.moveAbilityToBackground();
+    } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'moveAbilityToBackground failed: %{public}s', JSON.stringify(e));
+    }
+    return true;
   }
 
   build() {
@@ -236,6 +424,10 @@ struct Index {
         Text(`状态: ${this.status}`).fontSize(14).fontColor('#E6E6E6')
         if (this.profileText !== '') {
           Text(`输出: ${this.profileText}`).fontSize(14).fontColor('#E6E6E6')
+        }
+        if (this.running) {
+          Text(`音频: ${this.audioOn ? this.audioText : '关'}`)
+            .fontSize(13).fontColor(this.audioOn ? '#9FD8A0' : '#888888')
         }
         if (this.stats !== '') {
           Text(this.stats).fontSize(13).fontColor('#E6E6E6')
@@ -272,27 +464,48 @@ struct Index {
                 this.switchRotate(deg);
               })
           }, (deg: number) => deg.toString())
+          ForEach(this.resolutions, (res: string) => {
+            Text(res)
+              .fontSize(13)
+              .fontColor(this.curResolution === res ? '#0B1220' : '#C9A8FF')
+              .backgroundColor(this.curResolution === res ? '#C9A8FF' : '#1A2940')
+              .borderRadius(14)
+              .padding({ left: 12, right: 12, top: 6, bottom: 6 })
+              .margin(4)
+              .onClick(() => {
+                this.switchResolution(res);
+              })
+          }, (res: string) => res)
         }
         .width('100%')
       }
 
-      Button(this.running ? '停止' : '开始推流')
-        .width(200)
-        .fontSize(18)
-        .onClick(() => {
-          if (this.running) {
-            this.doStop();
-          } else {
-            this.doStart();
-          }
-        })
+      Row({ space: 16 }) {
+        Button(this.running ? '停止' : '开始推流')
+          .width(200)
+          .fontSize(18)
+          .onClick(() => {
+            if (this.running) {
+              this.doStop();
+            } else {
+              this.doStart();
+            }
+          })
+        Button('关闭')
+          .width(88)
+          .fontSize(16)
+          .backgroundColor('#5C2A35')
+          .onClick(() => {
+            this.doClose();
+          })
+      }
 
       Column({ space: 4 }) {
         Text('同一局域网内可接入:').fontSize(13).fontColor('#AAAAAA')
         Text('VLC / ffmpeg: rtsp://手机IP:8554/camN(每颗摄像头一路)').fontSize(12).fontColor('#888888')
         Text('NVR / Frigate: 通过 ONVIF 自动发现添加(多 Profile)').fontSize(12).fontColor('#888888')
         Text('浏览器: http://手机IP:8090/ 快照与 MJPEG').fontSize(12).fontColor('#888888')
-        Text('熄屏与后台运行可持续推流(常驻通知)').fontSize(12).fontColor('#888888')
+        Text('熄屏与后台可持续推流;系统返回=进后台,点「关闭」才退出').fontSize(12).fontColor('#888888')
       }
       .alignItems(HorizontalAlign.Start)
       .width('100%')

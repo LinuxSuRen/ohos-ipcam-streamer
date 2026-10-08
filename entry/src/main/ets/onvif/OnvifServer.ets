@@ -6,7 +6,10 @@ import util from '@ohos.util';
 import { lanAddress } from '../net/NetUtil';
 import { CamRegistry } from '../net/CamRegistry';
 import { HttpServer } from '../http/HttpServer';
+import { RtspServer } from '../rtsp/RtspServer';
 import { deviceModel, deviceOs, deviceLabel, deviceHardware, ensureDeviceId } from '../entryability/DeviceIdentity';
+import { PtzController } from './PtzController';
+import { CameraSource } from '../camera/CameraSource';
 
 const DOMAIN = 0x0809;
 const TAG = 'ipcam.OnvifServer';
@@ -241,7 +244,12 @@ export class OnvifServer {
   private static handleSoap(body: string): string {
     const ip = lanAddress();
     let inner = '';
-    if (body.indexOf('GetSystemDateAndTime') >= 0) {
+    /* PTZ 服务:变焦(手机无云台,Pan/Tilt 忽略应答成功)。
+     * 用 tag 级匹配(任意命名空间前缀),防 'Stop' 之类词干误撞其他动作 */
+    const ptzOp = new RegExp('<[A-Za-z0-9]+:?(ContinuousMove|AbsoluteMove|RelativeMove|Stop|GetStatus|GetConfigurationOptions)[\\s>]').exec(body);
+    if (ptzOp !== null) {
+      inner = OnvifServer.handlePtz(ptzOp[1], body, ip);
+    } else if (body.indexOf('GetSystemDateAndTime') >= 0) {
       const d = new Date();
       const p2 = (v: number) => v.toString().padStart(2, '0');
       inner = '<tds:GetSystemDateAndTimeResponse><tds:SystemDateTime>' +
@@ -254,6 +262,7 @@ export class OnvifServer {
     } else if (body.indexOf('GetCapabilities') >= 0) {
       inner = '<tds:GetCapabilitiesResponse><tds:Capabilities>' +
         `<tt:Device><tt:XAddr>http://${ip}:${HTTP_PORT}/onvif/device_service</tt:XAddr></tt:Device>` +
+        `<tt:PTZ><tt:XAddr>http://${ip}:${HTTP_PORT}/onvif/ptz_service</tt:XAddr></tt:PTZ>` +
         `<tt:Media><tt:XAddr>http://${ip}:${HTTP_PORT}/onvif/media_service</tt:XAddr>` +
         '<tt:StreamingCapabilities>' +
         '<tt:RTPMulticast>false</tt:RTPMulticast>' +
@@ -292,8 +301,26 @@ export class OnvifServer {
           '<tt:Quality>4</tt:Quality>' +
           `<tt:RateControl><tt:FrameRateLimit>${c.fps}</tt:FrameRateLimit>` +
           `<tt:BitrateLimit>${kbps}</tt:BitrateLimit></tt:RateControl>` +
-          '</tt:VideoEncoderConfiguration>' +
-          '</trt:Profiles>';
+          '</tt:VideoEncoderConfiguration>';
+        /* PTZ 能力声明:onvif-ai 等客户端以 Profile 内 PTZConfiguration 的存在
+         * 判定 PTZ 可用(进而显示变焦控制);token 与 GetConfigurationOptions 对应 */
+        profiles += `<tt:PTZConfiguration token="ptz_${n}">` +
+          `<tt:Name>ptz_${n}</tt:Name>` +
+          '<tt:UseCount>1</tt:UseCount>' +
+          `<tt:NodeToken>PTZNODE_${n}</tt:NodeToken>` +
+          '</tt:PTZConfiguration>';
+        if (RtspServer.isAudioEnabled()) {
+          /* 音频协商:Profile 声明 AAC 能力,客户端按需拉取 */
+          profiles += `<tt:AudioEncoderConfiguration token="aec_${n}">` +
+            `<tt:Name>aac_${n}</tt:Name>` +
+            '<tt:UseCount>1</tt:UseCount>' +
+            '<tt:Encoding>AAC</tt:Encoding>' +
+            '<tt:Bitrate>64</tt:Bitrate>' +
+            '<tt:SampleRate>44100</tt:SampleRate>' +
+            '<tt:SessionTimeout>PT60S</tt:SessionTimeout>' +
+            '</tt:AudioEncoderConfiguration>';
+        }
+        profiles += '</trt:Profiles>';
       }
       inner = `<trt:GetProfilesResponse>${profiles}</trt:GetProfilesResponse>`;
     } else if (body.indexOf('GetStreamUri') >= 0) {
@@ -330,12 +357,75 @@ export class OnvifServer {
       OnvifServer.soapEnvelope(soapBody);
   }
 
+  /** PTZ 操作处理:onvif-ai/NVR 的变焦指令 → 相机 zoomRatio。 */
+  private static handlePtz(op: string, body: string, ip: string): string {
+    const token = extract(body, 'ProfileToken>([^<]+)<');
+    const cam = OnvifServer.cameraOfToken(token);
+    if (op === 'ContinuousMove') {
+      const zv = parseFloat(extract(body, 'Zoom x=["\'](-?[0-9.]+)["\']'));
+      const ts = parseFloat(extract(body, 'Timeout>PT([0-9.]+)S'));
+      PtzController.continuousMove(cam, isNaN(zv) ? 0 : zv, isNaN(ts) ? 5 : ts);
+      return '<tptz:ContinuousMoveResponse/>';
+    }
+    if (op === 'AbsoluteMove') {
+      const pos = parseFloat(extract(body, 'Zoom x=["\'](-?[0-9.]+)["\']'));
+      if (!isNaN(pos)) {
+        PtzController.absoluteMove(cam, pos);
+      }
+      return '<tptz:AbsoluteMoveResponse/>';
+    }
+    if (op === 'RelativeMove') {
+      /* 相对移动按全范围的百分比解释 */
+      const dz = parseFloat(extract(body, 'Zoom x=["\'](-?[0-9.]+)["\']'));
+      if (!isNaN(dz)) {
+        const cur = PtzController.position(cam);
+        if (cur >= 0) {
+          PtzController.absoluteMove(cam, cur + dz);
+        }
+      }
+      return '<tptz:RelativeMoveResponse/>';
+    }
+    if (op === 'Stop') {
+      PtzController.stop(cam);
+      return '<tptz:StopResponse/>';
+    }
+    if (op === 'GetStatus') {
+      const pos = PtzController.position(cam);
+      const zoom = pos >= 0 ? `<tt:Position><tt:Zoom x="${pos.toFixed(3)}" space="http://www.onvif.org/ver10/tptz/ZoomSpaces/PositionGenericSpace"/></tt:Position>` : '';
+      return `<tptz:GetStatusResponse><tptz:PTZStatus>${zoom}<tt:MoveStatus><tt:PanTilt>IDLE</tt:PanTilt><tt:Zoom>IDLE</tt:Zoom></tt:MoveStatus><tt:Error>NO_ERROR</tt:Error></tptz:PTZStatus></tptz:GetStatusResponse>`;
+    }
+    if (op === 'GetConfigurationOptions') {
+      /* 该命令用 ConfigurationToken(ptz_N,对应 profile_N);若请求带的是
+       * ProfileToken 也能正确提取,两者都兼容 */
+      const cfgToken = extract(body, 'ConfigurationToken>([^<]+)<');
+      const cfgCam = OnvifServer.cameraOfToken(cfgToken);
+      const cam2 = cfgToken !== '' ? cfgCam : cam;
+      const has = PtzController.hasZoom(cam2);
+      let zoomSpaces = '';
+      if (has) {
+        zoomSpaces =
+        '<tt:ContinuousZoomVelocitySpace><tt:XRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:XRange><tt:URI>http://www.onvif.org/ver10/tptz/ZoomSpaces/ZoomVelocityGenericSpace</tt:URI></tt:ContinuousZoomVelocitySpace>' +
+        '<tt:AbsoluteZoomPositionSpace><tt:XRange><tt:Min>0</tt:Min><tt:Max>1</tt:Max></tt:XRange><tt:URI>http://www.onvif.org/ver10/tptz/ZoomSpaces/AbsoluteZoomGenericSpace</tt:URI></tt:AbsoluteZoomPositionSpace>' +
+        '<tt:RelativeZoomTranslationSpace><tt:XRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:XRange><tt:URI>http://www.onvif.org/ver10/tptz/ZoomSpaces/RelativeZoomGenericSpace</tt:URI></tt:RelativeZoomTranslationSpace>' +
+        '<tt:ZoomSpeed><tt:XRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:XRange></tt:ZoomSpeed>';
+        /* 自定义空间:真实倍率范围(客户端据此把归一位置换算成 "x 倍率" 展示) */
+        const range = CameraSource.getZoomRange(cam2);
+        zoomSpaces += '<tt:AbsoluteZoomPositionSpace>' +
+          `<tt:XRange><tt:Min>${range[0]}</tt:Min><tt:Max>${range[1]}</tt:Max></tt:XRange>` +
+          '<tt:URI>http://www.linuxsuren.org/onvif/zoom/ratio</tt:URI></tt:AbsoluteZoomPositionSpace>';
+      }
+      return `<tptz:GetConfigurationOptionsResponse><tptz:PTZConfigurationOptions><tt:PTZTimeout><tt:Min>PT1S</tt:Min><tt:Max>PT60S</tt:Max></tt:PTZTimeout><tt:Spaces>${zoomSpaces}</tt:Spaces></tptz:PTZConfigurationOptions></tptz:GetConfigurationOptionsResponse>`;
+    }
+    return '';
+  }
+
   private static soapEnvelope(inner: string): string {
     return '<?xml version="1.0" encoding="UTF-8"?>' +
       '<s:Envelope xmlns:s="http://www.w3.org/2003/05/soap-envelope" ' +
       'xmlns:tds="http://www.onvif.org/ver10/device/wsdl" ' +
       'xmlns:trt="http://www.onvif.org/ver10/media/wsdl" ' +
-      'xmlns:tt="http://www.onvif.org/ver10/schema">' +
+      'xmlns:tt="http://www.onvif.org/ver10/schema" ' +
+      'xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">' +
       `<s:Body>${inner}</s:Body></s:Envelope>`;
   }
 

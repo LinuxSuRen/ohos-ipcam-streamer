@@ -16,3 +16,15 @@ export const snapshotWidth: (cam: number) => number;
 export const snapshotHeight: (cam: number) => number;
 /** 取指定相机最新旋转后帧的 RGBA 像素(按需 NV12→RGBA);尚无帧时返回 null */
 export const takeSnapshotRgba: (cam: number) => ArrayBuffer | null;
+/** 注册音频帧回调:type 0 = AAC 裸帧(48kHz,每 AU 1024 样本),1 = G.711 PCMA 帧(160 字节 = 20ms) */
+export const setAudioCallback: (cb: (frame: ArrayBuffer, type: number) => void) => void;
+/** 启动麦克风采集(48k)+ AAC + G.711 编码;返回 0=失败 1=仅G.711 2=AAC+G.711 */
+export const startAudio: () => number;
+/** 停止音频管线 */
+export const stopAudio: () => void;
+/** 启动对讲回传扬声器(8kHz 单声道);失败抛错 */
+export const startSpeaker: () => number;
+/** 停止扬声器 */
+export const stopSpeaker: () => void;
+/** 对讲回传:写入一段 PCMA 字节(A-law),解码后播放 */
+export const speakerWritePCMA: (data: ArrayBuffer) => void;

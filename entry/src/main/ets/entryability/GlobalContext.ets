@@ -19,6 +19,29 @@ export function isCameraGranted(): boolean {
   return cameraGranted;
 }
 
+let micGranted = false;
+
+export function setMicGranted(granted: boolean): void {
+  micGranted = granted;
+}
+
+export function isMicGranted(): boolean {
+  return micGranted;
+}
+
+let appForeground = true;
+
+/** 前后台状态(EntryAbility onForeground/onBackground 维护)。
+ * 后台时系统拒绝相机会话(实测 CreateCameraInput 返回 null),
+ * 看门狗据此暂停重试,回前台后立即恢复推流。 */
+export function setAppForeground(foreground: boolean): void {
+  appForeground = foreground;
+}
+
+export function isAppForeground(): boolean {
+  return appForeground;
+}
+
 let persistedRotate = 0;
 let persistedCam = -1;
 

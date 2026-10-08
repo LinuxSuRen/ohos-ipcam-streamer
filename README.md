@@ -22,13 +22,45 @@
 
 ## 功能
 
+- **音频随视频协商推送(双音轨)**:麦克风采集(48kHz)→ AAC-LC(trackID=1,PT 97)
+  + G.711 PCMA(trackID=2,PT 8,8kHz/20ms)双编码;客户端经 RTSP SETUP 按轨协商,
+  各取所需——只 SETUP 视频轨则无音频,兼容 AAC 的播放器(ffmpeg/VLC)取 AAC,
+  ONVIF 生态设备/NVR 取 G.711。AAC 编码器不可用时自动降级仅 G.711;麦克风不可用
+  时降级纯视频。ONVIF Profile 声明 AudioEncoderConfiguration(G711,生态惯例)
 - **多摄像头并发推流**:前后置(及多摄)同时输出,每路独立 RTSP 地址与 ONVIF Profile
 - RTSP / HTTP(MJPEG+快照) / ONVIF 三协议,ONVIF 每相机一个 Profile(token=profile_{N+1})
 - HTTP 状态页:设备信息、各路统计(fps/帧数)、入口链接、内嵌预览、上次崩溃堆栈
 - 多客户端同时拉流(TCP interleaved)
-- 后台常驻 + 熄屏持续推流(长时任务,真机实测熄屏双路不断流)
+- **后台与退出策略**:系统返回键只进后台不退出;界面「关闭」按钮是唯一退出入口
+  (停止推流、结束长时任务、进程退出)
 - 崩溃防护网:未捕获异常落盘,下次启动在应用界面与状态页展示
 - 纯 ArkTS 主体 + 单个 napi C 垫片(多相机多实例封装,~700 行)
+
+## 变焦控制(ONVIF PTZ)
+
+ONVIF PTZ 服务(同一 SOAP 端口,`/onvif/ptz_service`)支持 Zoom 轴:
+`ContinuousMove`(速度 ±1,200ms 步进全范围 4%×v)、`AbsoluteMove`(位置 [0,1]
+线性映射 zoomRatio)、`RelativeMove`、`Stop`、`GetStatus`(归一位置)、
+`GetConfigurationOptions`(变焦范围上报)。实测后摄 0.55x–100x 变焦全程可用,
+推流画面随之平滑变化;前置按能力上报(无变焦则空 Zoom spaces)。
+Pan/Tilt 手机无可动部件,忽略并应答成功。
+
+## 对讲回传(浏览器 → 手机扬声器)
+
+RTSP SDP 额外提供一条 `a=sendonly` 的 G.711 PCMA 回传轨(trackID=3,
+ONVIF backchannel 惯例,gortsplib 以 sendonly 识别):客户端 SETUP 该轨并经
+interleaved 通道 6 推送 RTP,手机端 A-law 解码后从扬声器实时播放(8kHz 单声道,
+环形缓冲 + 满则丢最旧保证实时)。onvif-ai 的"对讲/喊话"即走此通道。
+
+## 后台运行说明(系统限制)
+
+- **熄屏 + 应用在前台**:双路持续推流(长时任务 DATA_TRANSFER 保持不冻结,实测不断流)
+- **应用退到后台**:系统拒绝后台应用持有相机会话(实测 CreateCameraInput 返回 null,
+  长时任务也无法豁免,属隐私限制),推流暂停;应用不会退出,状态显示
+  「后台暂停」,回到前台后看门狗自动重建相机管线并恢复推流,已连接的拉流端
+  无需操作即可继续收流
+- 帧停滞自愈分级:单次停滞重开该路会话;连续停滞全量重建管线;后台期间不做
+  无谓重试(避免相机设备半开状态楔死,实测该状态仅进程退出可解除)
 
 ## 画面方向
 
@@ -41,8 +73,8 @@
 拉流端:
 
 ```bash
-ffplay -rtsp_transport tcp rtsp://<手机IP>:8554/cam0    # 后置
-ffplay -rtsp_transport tcp rtsp://<手机IP>:8554/cam1    # 前置
+ffplay -rtsp_transport tcp rtsp://<手机IP>:8554/cam0    # 后置(含音频)
+ffplay -rtsp_transport tcp rtsp://<手机IP>:8554/cam1    # 前置(含音频)
 # OpenCV(需指定 TCP):
 #   os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS'] = 'rtsp_transport;tcp'
 #   cv2.VideoCapture('rtsp://<手机IP>:8554/cam0')
@@ -84,6 +116,11 @@ API 基线 5.0.0 (API 12);已实测 HarmonyOS 6.1.1 (API 24) 真机(SGT-AL50,前
 
 ## 已验证
 
+- 对讲回传端到端:自定义 RTSP 客户端向 trackID=3 推 8 秒 440Hz PCMA 音调,
+  手机端全部接收(400 包)并经扬声器播放
+- 音频端到端:ffmpeg 拉流解出 AAC 48000 立体声与 G.711(pcm_alaw 8000 单声道,
+  电平实测正常);仅 SETUP 视频轨的客户端收不到任何音频包、仅 SETUP G.711 轨的
+  客户端 0 AAC 包(协商生效);onvif-ai 联调自动选择 G.711 轨并在界面显示
 - 前后摄并发双路 RTSP 同时拉流:1280x720 横屏与 704x1280 竖屏均零解码错误
 - HTTP 状态页 / 每路快照 / 每路 MJPEG 流(多路并发请求合流编码)
 - ONVIF:GetProfiles 多 Profile(相机名/分辨率动态)、GetStreamUri/GetSnapshotUri 按 Profile 映射、WS-Discovery Probe 应答与 Hello
