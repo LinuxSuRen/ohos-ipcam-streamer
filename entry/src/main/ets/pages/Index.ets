@@ -11,7 +11,8 @@ import { OnvifServer } from '../onvif/OnvifServer';
 import { BackgroundKeeper } from '../background/BackgroundKeeper';
 import { CrashGuard } from '../entryability/CrashGuard';
 import { getAbilityContext, isCameraGranted, isMicGranted, isAppForeground } from '../entryability/GlobalContext';
-import { loadSettings, saveSettings } from '../entryability/PersistStore';
+import { loadSettings, saveSettings, Settings } from '../entryability/PersistStore';
+import { AuthConfig } from '../auth/Auth';
 import { refreshLanAddress } from '../net/NetUtil';
 import hilog from '@ohos.hilog';
 const DOMAIN = 0x0805;
@@ -59,6 +60,9 @@ struct Index {
   @State crashText: string = '';
   @State audioText: string = '';
   @State resolutions: string[] = [];
+  @State authEnabled: boolean = false;
+  private authUser: string = '';
+  private authPass: string = '';
   private curResolution: string = '1280x720';
   private audioOn: boolean = false;
   private timerId: number = -1;
@@ -73,6 +77,9 @@ struct Index {
     const st = loadSettings(getAbilityContext()!);
     this.curRotate = st.rotate;
     this.curResolution = st.resolution;
+    this.authEnabled = st.authEnabled;
+    this.authUser = st.authUser;
+    this.authPass = st.authPass;
     const crash = CrashGuard.consume(getAbilityContext()!);
     if (crash !== null) {
       this.crashText = crash.split('\n').slice(0, 2).join('\n');
@@ -88,6 +95,20 @@ struct Index {
     }
   }
 
+  /** 统一持久化入口:认证字段随所有保存路径一起落盘,避免遗漏。 */
+  private persist(autoStart: boolean): void {
+    const s: Settings = {
+      rotate: this.curRotate,
+      cam: -1,
+      autoStart: autoStart,
+      resolution: this.curResolution,
+      authEnabled: this.authEnabled,
+      authUser: this.authUser,
+      authPass: this.authPass
+    };
+    saveSettings(getAbilityContext()!, s);
+  }
+
   /**
    * 方向切换:该系统 HCODEC 不支持进程内二次配置编码器
    * (第二实例 need-input 永不回调,实测),因此:保存配置 → 退出应用,
@@ -98,12 +119,7 @@ struct Index {
       return;
     }
     try {
-      saveSettings(getAbilityContext()!, {
-        rotate: deg,
-        cam: -1,
-        autoStart: true,
-        resolution: this.curResolution
-      });
+      this.persist(true);
       await getAbilityContext()!.terminateSelf();
     } catch (e) {
       const msg = e instanceof Error ? e.message : JSON.stringify(e);
@@ -137,12 +153,7 @@ struct Index {
       return;
     }
     try {
-      saveSettings(getAbilityContext()!, {
-        rotate: this.curRotate,
-        cam: -1,
-        autoStart: true,
-        resolution: res
-      });
+      this.persist(true);
       await getAbilityContext()!.terminateSelf();
     } catch (e) {
       const msg = e instanceof Error ? e.message : JSON.stringify(e);
@@ -182,8 +193,9 @@ struct Index {
         throw new Error('no camera available');
       }
 
-      /* 服务器先行:拉流端可立即连接 */
+      /* 服务器先行:拉流端可立即连接;认证凭证注入三服务 */
       this.status = '启动 RTSP / ONVIF / HTTP';
+      AuthConfig.configure(this.authEnabled, this.authUser, this.authPass);
       await RtspServer.start(WANT_FPS);
       await OnvifServer.start(getAbilityContext()!);
       await HttpServer.start();
@@ -241,12 +253,7 @@ struct Index {
       this.httpUrl = ip !== '' ? `http://${ip}:8090/ (快照/网页)` : '';
       this.running = true;
       this.status = '推流中';
-      saveSettings(getAbilityContext()!, {
-        rotate: this.curRotate,
-        cam: -1,
-        autoStart: false,
-        resolution: this.curResolution
-      });
+      this.persist(false);
       this.timerId = setInterval(() => {
         const parts = this.camInfos.map((c) => `${c.label}=${FrameHub.fps(c.index)}fps`);
         this.stats = `${parts.join(' ')} RTSP客户端=${RtspServer.sessionCount()}`;
@@ -428,6 +435,8 @@ struct Index {
         if (this.running) {
           Text(`音频: ${this.audioOn ? this.audioText : '关'}`)
             .fontSize(13).fontColor(this.audioOn ? '#9FD8A0' : '#888888')
+          Text(`认证: ${this.authEnabled ? `开启(${this.authUser})` : '关'}`)
+            .fontSize(13).fontColor(this.authEnabled ? '#9FD8A0' : '#888888')
         }
         if (this.stats !== '') {
           Text(this.stats).fontSize(13).fontColor('#E6E6E6')
@@ -478,6 +487,37 @@ struct Index {
           }, (res: string) => res)
         }
         .width('100%')
+      }
+
+      if (!this.running) {
+        Column({ space: 8 }) {
+          Row({ space: 10 }) {
+            Toggle({ type: ToggleType.Switch, isOn: this.authEnabled })
+              .onChange((on: boolean) => {
+                this.authEnabled = on;
+              })
+            Text('访问认证(RTSP/HTTP/ONVIF 共用一账号)')
+              .fontSize(14).fontColor('#E6E6E6')
+          }
+          if (this.authEnabled) {
+            TextInput({ placeholder: '用户名', text: this.authUser })
+              .fontSize(14)
+              .onChange((v: string) => {
+                this.authUser = v;
+              })
+            TextInput({ placeholder: '密码', text: this.authPass })
+              .type(InputType.Password)
+              .fontSize(14)
+              .onChange((v: string) => {
+                this.authPass = v;
+              })
+            Text('拉流地址形如 rtsp://用户名:密码@手机IP:8554/cam0;口令仅存本机沙箱')
+              .fontSize(12).fontColor('#888888')
+          }
+        }
+        .alignItems(HorizontalAlign.Start)
+        .width('100%')
+        .padding(12)
       }
 
       Row({ space: 16 }) {

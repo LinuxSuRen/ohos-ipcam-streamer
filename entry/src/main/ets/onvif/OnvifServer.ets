@@ -10,6 +10,7 @@ import { RtspServer } from '../rtsp/RtspServer';
 import { deviceModel, deviceOs, deviceLabel, deviceHardware, ensureDeviceId } from '../entryability/DeviceIdentity';
 import { PtzController } from './PtzController';
 import { CameraSource } from '../camera/CameraSource';
+import { AuthConfig, verifyWsUsernameToken } from '../auth/Auth';
 
 const DOMAIN = 0x0809;
 const TAG = 'ipcam.OnvifServer';
@@ -243,6 +244,17 @@ export class OnvifServer {
 
   private static handleSoap(body: string): string {
     const ip = lanAddress();
+    /* 认证门禁:pre-auth 白名单(GetSystemDateAndTime 对时/能力发现)放行,
+     * 其余操作(GetProfiles/GetStreamUri/快照/设备信息/PTZ)要求
+     * WS-Security UsernameToken;未授权按 ONVIF 惯例回 HTTP 401 */
+    if (AuthConfig.isEnabled() &&
+      body.indexOf('GetSystemDateAndTime') < 0 &&
+      body.indexOf('GetCapabilities') < 0 &&
+      body.indexOf('GetServices') < 0 &&
+      !verifyWsUsernameToken(body)) {
+      hilog.warn(DOMAIN, TAG, 'soap 401 unauthorized');
+      return 'HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n';
+    }
     let inner = '';
     /* PTZ 服务:变焦(手机无云台,Pan/Tilt 忽略应答成功)。
      * 用 tag 级匹配(任意命名空间前缀),防 'Stop' 之类词干误撞其他动作 */

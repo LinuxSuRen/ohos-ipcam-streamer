@@ -100,6 +100,22 @@ RTSP 仅支持 TCP interleaved 传输(RFC 2326 §12.39);UDP SETUP 请求会收�
 
 4. 长时间推流建议插电并允许电池优化豁免
 
+## 访问认证(可选)
+
+应用界面提供「访问认证」开关与账号设置(单一账号,RTSP/HTTP/ONVIF 三服务共用;默认关闭,升级零破坏)。开启后:
+
+- **RTSP**:HTTP Digest(MD5,无 qop 兼容形态)+ Basic,`OPTIONS` 放行,其余方法须携带凭证:
+
+```bash
+ffplay -rtsp_transport tcp rtsp://admin:密码@<手机IP>:8554/cam0
+```
+
+- **HTTP**:状态页/快照/MJPEG 全部要求 Basic,浏览器原生弹登录框
+- **ONVIF**:WS-Security UsernameToken(PasswordDigest,`Base64(SHA1(nonce+Created+口令))`,Created ±5 分钟;
+  兼容 PasswordText)。`GetSystemDateAndTime`/`GetCapabilities`/`GetServices` 免认证(pre-auth 惯例,供对时与能力发现),
+  其余操作未授权回 HTTP 401;NVR/onvif-ai 在设备配置里填同一账号即可
+- 口令明文存于应用私有沙箱 `settings.json`(Digest 服务端校验需明文参与哈希,无法只存摘要);WS-Discovery 发现不设防
+
 ## 构建
 
 依赖:华为 Command Line Tools(hvigor 6.x,含 HarmonyOS SDK)。
