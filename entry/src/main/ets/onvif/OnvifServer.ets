@@ -9,6 +9,7 @@ import { HttpServer } from '../http/HttpServer';
 import { RtspServer } from '../rtsp/RtspServer';
 import { deviceModel, deviceOs, deviceLabel, deviceHardware, ensureDeviceId } from '../entryability/DeviceIdentity';
 import { PtzController } from './PtzController';
+import { CameraSource } from '../camera/CameraSource';
 
 const DOMAIN = 0x0809;
 const TAG = 'ipcam.OnvifServer';
@@ -301,6 +302,13 @@ export class OnvifServer {
           `<tt:RateControl><tt:FrameRateLimit>${c.fps}</tt:FrameRateLimit>` +
           `<tt:BitrateLimit>${kbps}</tt:BitrateLimit></tt:RateControl>` +
           '</tt:VideoEncoderConfiguration>';
+        /* PTZ 能力声明:onvif-ai 等客户端以 Profile 内 PTZConfiguration 的存在
+         * 判定 PTZ 可用(进而显示变焦控制);token 与 GetConfigurationOptions 对应 */
+        profiles += `<tt:PTZConfiguration token="ptz_${n}">` +
+          `<tt:Name>ptz_${n}</tt:Name>` +
+          '<tt:UseCount>1</tt:UseCount>' +
+          `<tt:NodeToken>PTZNODE_${n}</tt:NodeToken>` +
+          '</tt:PTZConfiguration>';
         if (RtspServer.isAudioEnabled()) {
           /* 音频协商:Profile 声明 AAC 能力,客户端按需拉取 */
           profiles += `<tt:AudioEncoderConfiguration token="aec_${n}">` +
@@ -388,11 +396,19 @@ export class OnvifServer {
     }
     if (op === 'GetConfigurationOptions') {
       const has = PtzController.hasZoom(cam);
-      const zoomSpaces = has ?
+      let zoomSpaces = '';
+      if (has) {
+        zoomSpaces =
         '<tt:ContinuousZoomVelocitySpace><tt:XRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:XRange><tt:URI>http://www.onvif.org/ver10/tptz/ZoomSpaces/ZoomVelocityGenericSpace</tt:URI></tt:ContinuousZoomVelocitySpace>' +
         '<tt:AbsoluteZoomPositionSpace><tt:XRange><tt:Min>0</tt:Min><tt:Max>1</tt:Max></tt:XRange><tt:URI>http://www.onvif.org/ver10/tptz/ZoomSpaces/AbsoluteZoomGenericSpace</tt:URI></tt:AbsoluteZoomPositionSpace>' +
         '<tt:RelativeZoomTranslationSpace><tt:XRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:XRange><tt:URI>http://www.onvif.org/ver10/tptz/ZoomSpaces/RelativeZoomGenericSpace</tt:URI></tt:RelativeZoomTranslationSpace>' +
-        '<tt:ZoomSpeed><tt:XRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:XRange></tt:ZoomSpeed>' : '';
+        '<tt:ZoomSpeed><tt:XRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:XRange></tt:ZoomSpeed>';
+        /* 自定义空间:真实倍率范围(客户端据此把归一位置换算成 "x 倍率" 展示) */
+        const range = CameraSource.getZoomRange(cam);
+        zoomSpaces += '<tt:AbsoluteZoomPositionSpace>' +
+          `<tt:XRange><tt:Min>${range[0]}</tt:Min><tt:Max>${range[1]}</tt:Max></tt:XRange>` +
+          '<tt:URI>http://www.linuxsuren.org/onvif/zoom/ratio</tt:URI></tt:AbsoluteZoomPositionSpace>';
+      }
       return `<tptz:GetConfigurationOptionsResponse><tptz:PTZConfigurationOptions><tt:PTZTimeout><tt:Min>PT1S</tt:Min><tt:Max>PT60S</tt:Max></tt:PTZTimeout><tt:Spaces>${zoomSpaces}</tt:Spaces></tptz:PTZConfigurationOptions></tptz:GetConfigurationOptionsResponse>`;
     }
     return '';
