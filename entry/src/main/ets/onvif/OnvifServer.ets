@@ -9,6 +9,7 @@ import { HttpServer } from '../http/HttpServer';
 import { RtspServer } from '../rtsp/RtspServer';
 import { deviceModel, deviceOs, deviceLabel, deviceHardware, ensureDeviceId } from '../entryability/DeviceIdentity';
 import { PtzController } from './PtzController';
+import { Presets, Preset } from './Presets';
 import { CameraSource } from '../camera/CameraSource';
 import { AuthConfig, verifyWsUsernameToken } from '../auth/Auth';
 
@@ -75,6 +76,7 @@ export class OnvifServer {
     OnvifServer.deviceId = ensureDeviceId(context);
     OnvifServer.instanceId = Math.floor(Date.now() / 1000);
     OnvifServer.msgNo = 0;
+    Presets.init(context);
     await OnvifServer.startHttp();
     OnvifServer.startDiscovery();
     OnvifServer.running = true;
@@ -256,9 +258,10 @@ export class OnvifServer {
       return 'HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n';
     }
     let inner = '';
-    /* PTZ 服务:变焦(手机无云台,Pan/Tilt 忽略应答成功)。
-     * 用 tag 级匹配(任意命名空间前缀),防 'Stop' 之类词干误撞其他动作 */
-    const ptzOp = new RegExp('<[A-Za-z0-9]+:?(ContinuousMove|AbsoluteMove|RelativeMove|Stop|GetStatus|GetConfigurationOptions)[\\s>]').exec(body);
+    /* PTZ 服务:变焦(手机无云台,Pan/Tilt 忽略应答成功)+
+     * 预置点(变焦位置存取)。用 tag 级匹配(任意命名空间前缀),
+     * 防 'Stop' 之类词干误撞其他动作 */
+    const ptzOp = new RegExp('<[A-Za-z0-9]+:?(ContinuousMove|AbsoluteMove|RelativeMove|Stop|GetStatus|GetConfigurationOptions|GetPresets|SetPreset|GotoPreset|RemovePreset)[\\s>]').exec(body);
     if (ptzOp !== null) {
       inner = OnvifServer.handlePtz(ptzOp[1], body, ip);
     } else if (body.indexOf('GetSystemDateAndTime') >= 0) {
@@ -369,10 +372,45 @@ export class OnvifServer {
       OnvifServer.soapEnvelope(soapBody);
   }
 
-  /** PTZ 操作处理:onvif-ai/NVR 的变焦指令 → 相机 zoomRatio。 */
+  /** PTZ 操作处理:onvif-ai/NVR 的变焦指令 → 相机 zoomRatio;
+   * 预置点四件套(GetPresets/SetPreset/GotoPreset/RemovePreset)
+   * 以变焦位置为载荷(手机无云台,Pan/Tilt 恒 0)。 */
   private static handlePtz(op: string, body: string, ip: string): string {
     const token = extract(body, 'ProfileToken>([^<]+)<');
     const cam = OnvifServer.cameraOfToken(token);
+    if (op === 'GetPresets') {
+      let items = '';
+      for (const p of Presets.list(cam)) {
+        items += OnvifServer.presetXml(p);
+      }
+      return `<tptz:GetPresetsResponse>${items}</tptz:GetPresetsResponse>`;
+    }
+    if (op === 'SetPreset') {
+      if (!PtzController.hasZoom(cam)) {
+        return OnvifServer.ptzFault('ter:ActionNotSupported', 'camera has no zoom');
+      }
+      const pos = PtzController.position(cam);
+      if (pos < 0) {
+        return OnvifServer.ptzFault('ter:Action', 'zoom position unavailable');
+      }
+      const p = Presets.set(cam, extract(body, 'PresetToken>([^<]+)<'),
+        extract(body, 'Name>([^<]+)<'), pos);
+      return `<tptz:SetPresetResponse><tptz:PresetToken>${p.token}</tptz:PresetToken></tptz:SetPresetResponse>`;
+    }
+    if (op === 'GotoPreset') {
+      const p = Presets.get(cam, extract(body, 'PresetToken>([^<]+)<'));
+      if (p === null) {
+        return OnvifServer.ptzFault('ter:InvalidArgVal', 'preset not found');
+      }
+      PtzController.absoluteMove(cam, p.pos);
+      return '<tptz:GotoPresetResponse/>';
+    }
+    if (op === 'RemovePreset') {
+      if (!Presets.remove(cam, extract(body, 'PresetToken>([^<]+)<'))) {
+        return OnvifServer.ptzFault('ter:InvalidArgVal', 'preset not found');
+      }
+      return '<tptz:RemovePresetResponse/>';
+    }
     if (op === 'ContinuousMove') {
       const zv = parseFloat(extract(body, 'Zoom x=["\'](-?[0-9.]+)["\']'));
       const ts = parseFloat(extract(body, 'Timeout>PT([0-9.]+)S'));
@@ -429,6 +467,23 @@ export class OnvifServer {
       return `<tptz:GetConfigurationOptionsResponse><tptz:PTZConfigurationOptions><tt:PTZTimeout><tt:Min>PT1S</tt:Min><tt:Max>PT60S</tt:Max></tt:PTZTimeout><tt:Spaces>${zoomSpaces}</tt:Spaces></tptz:PTZConfigurationOptions></tptz:GetConfigurationOptionsResponse>`;
     }
     return '';
+  }
+
+  /** 预置点序列化:token/名称 + PanTilt(恒 0,无云台)+ Zoom(归一位置)。 */
+  private static presetXml(p: Preset): string {
+    return `<tptz:Preset token="${xmlEscape(p.token)}">` +
+      `<tt:Name>${xmlEscape(p.name)}</tt:Name>` +
+      '<tt:PTZPosition>' +
+      '<tt:PanTilt x="0" y="0" space="http://www.onvif.org/ver10/tptz/PanTiltSpaces/PositionGenericSpace"/>' +
+      `<tt:Zoom x="${p.pos.toFixed(3)}" space="http://www.onvif.org/ver10/tptz/ZoomSpaces/AbsoluteZoomGenericSpace"/>` +
+      '</tt:PTZPosition></tptz:Preset>';
+  }
+
+  /** PTZ 操作的 SOAP 1.2 Fault(预置点不存在/无变焦等业务失败)。 */
+  private static ptzFault(subcode: string, text: string): string {
+    return '<s:Fault><s:Code><s:Value>s:Sender</s:Value>' +
+      `<s:Subcode><s:Value>${subcode}</s:Value></s:Subcode></s:Code>` +
+      `<s:Reason><s:Text xml:lang="en">${xmlEscape(text)}</s:Text></s:Reason></s:Fault>`;
   }
 
   private static soapEnvelope(inner: string): string {

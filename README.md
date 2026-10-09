@@ -45,6 +45,11 @@ ONVIF PTZ 服务(同一 SOAP 端口,`/onvif/ptz_service`)支持 Zoom 轴:
 推流画面随之平滑变化;前置按能力上报(无变焦则空 Zoom spaces)。
 Pan/Tilt 手机无可动部件,忽略并应答成功。
 
+**预置点**:手机无云台,预置点即变焦位置——`SetPreset` 存当前变焦位、
+`GotoPreset` 回放、`GetPresets` 列表、`RemovePreset` 删除;Pan/Tilt 恒 0,
+Zoom 为归一位置。持久化于应用沙箱 `presets.json`(与 settings.json 分离),
+重启不丢;无变焦的前置相机 SetPreset 回 SOAP Fault,GetPresets 返回空列表。
+
 ## 对讲回传(浏览器 → 手机扬声器)
 
 RTSP SDP 额外提供一条 `a=sendonly` 的 G.711 PCMA 回传轨(trackID=3,
