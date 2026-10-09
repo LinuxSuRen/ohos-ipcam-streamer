@@ -440,9 +440,18 @@ export class OnvifServer {
       return '<tptz:StopResponse/>';
     }
     if (op === 'GetStatus') {
+      /* Position 必须完整携带 PanTilt+Zoom:客户端库把缺失元素解析为
+       * nil 指标,device-camera-onvif 曾因缺 PanTilt 解引用崩溃(整个
+       * gRPC 进程 panic 重启)。无变焦的相机 Zoom 报 0。 */
       const pos = PtzController.position(cam);
-      const zoom = pos >= 0 ? `<tt:Position><tt:Zoom x="${pos.toFixed(3)}" space="http://www.onvif.org/ver10/tptz/ZoomSpaces/PositionGenericSpace"/></tt:Position>` : '';
-      return `<tptz:GetStatusResponse><tptz:PTZStatus>${zoom}<tt:MoveStatus><tt:PanTilt>IDLE</tt:PanTilt><tt:Zoom>IDLE</tt:Zoom></tt:MoveStatus><tt:Error>NO_ERROR</tt:Error></tptz:PTZStatus></tptz:GetStatusResponse>`;
+      const zoomX = pos >= 0 ? pos.toFixed(3) : '0';
+      return `<tptz:GetStatusResponse><tptz:PTZStatus>` +
+        `<tt:Position>` +
+        `<tt:PanTilt x="0" y="0" space="http://www.onvif.org/ver10/tptz/PanTiltSpaces/PositionGenericSpace"/>` +
+        `<tt:Zoom x="${zoomX}" space="http://www.onvif.org/ver10/tptz/ZoomSpaces/PositionGenericSpace"/>` +
+        `</tt:Position>` +
+        `<tt:MoveStatus><tt:PanTilt>IDLE</tt:PanTilt><tt:Zoom>IDLE</tt:Zoom></tt:MoveStatus>` +
+        `<tt:Error>NO_ERROR</tt:Error></tptz:PTZStatus></tptz:GetStatusResponse>`;
     }
     if (op === 'GetConfigurationOptions') {
       /* 该命令用 ConfigurationToken(ptz_N,对应 profile_N);若请求带的是
