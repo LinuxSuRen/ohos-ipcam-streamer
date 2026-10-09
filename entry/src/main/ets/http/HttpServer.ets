@@ -8,6 +8,7 @@ import { CamRegistry } from '../net/CamRegistry';
 import { RtspServer } from '../rtsp/RtspServer';
 import { CrashGuard } from '../entryability/CrashGuard';
 import { deviceModel, deviceOs } from '../entryability/DeviceIdentity';
+import { AuthConfig, AUTH_REALM, verifyHttpBasic } from '../auth/Auth';
 
 const DOMAIN = 0x080C;
 const TAG = 'ipcam.HttpServer';
@@ -166,6 +167,24 @@ class HttpConnection {
     const head = this.buf.substring(0, idx);
     this.buf = '';
     const reqLine = head.split('\r\n')[0].split(' ');
+    /* 认证门禁:开启后所有路径(状态页/快照/MJPEG)要求 HTTP Basic,
+     * 浏览器原生弹登录框;放在方法检查前,401 不泄露路由信息 */
+    if (AuthConfig.isEnabled()) {
+      let authorization = '';
+      for (const line of head.split('\r\n')) {
+        if (line.toLowerCase().startsWith('authorization:')) {
+          authorization = line.substring(line.indexOf(':') + 1).trim();
+          break;
+        }
+      }
+      if (!verifyHttpBasic(authorization)) {
+        hilog.info(DOMAIN, TAG, '401 challenge');
+        this.send(`HTTP/1.0 401 Unauthorized\r\nWWW-Authenticate: Basic realm="${AUTH_REALM}"\r\n` +
+          `Content-Length: 0\r\nConnection: close\r\n\r\n`);
+        this.flushClose();
+        return;
+      }
+    }
     if (reqLine.length < 2 || reqLine[0] !== 'GET') {
       this.respondSimple(405, 'text/plain', 'method not allowed');
       this.flushClose();
@@ -252,6 +271,7 @@ class HttpConnection {
       `<h2>ohos-ipcam-streamer</h2>` +
       `<p>device: ${deviceModel()} (${deviceOs()})</p>` +
       `<p>audio: ${RtspServer.isAudioEnabled() ? 'AAC 44100Hz stereo (SDP trackID=1)' : 'none'}</p>` +
+      `<p>auth: ${AuthConfig.isEnabled() ? `on (${AuthConfig.getUser()})` : 'off'}</p>` +
       `<p>rtsp clients=${RtspServer.sessionCount()}</p>` +
       `<p><a style='color:#8cf' href='http://${ip}:8000/onvif/device_service'>onvif</a></p>`;
     for (const c of CamRegistry.list()) {

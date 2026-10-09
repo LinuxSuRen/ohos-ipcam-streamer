@@ -11,7 +11,9 @@ import { OnvifServer } from '../onvif/OnvifServer';
 import { BackgroundKeeper } from '../background/BackgroundKeeper';
 import { CrashGuard } from '../entryability/CrashGuard';
 import { getAbilityContext, isCameraGranted, isMicGranted, isAppForeground } from '../entryability/GlobalContext';
-import { loadSettings, saveSettings } from '../entryability/PersistStore';
+import router from '@ohos.router';
+import { loadSettings, saveSettings, Settings } from '../entryability/PersistStore';
+import { AuthConfig } from '../auth/Auth';
 import { refreshLanAddress } from '../net/NetUtil';
 import hilog from '@ohos.hilog';
 const DOMAIN = 0x0805;
@@ -59,6 +61,9 @@ struct Index {
   @State crashText: string = '';
   @State audioText: string = '';
   @State resolutions: string[] = [];
+  @State authEnabled: boolean = false;
+  private authUser: string = '';
+  private authPass: string = '';
   private curResolution: string = '1280x720';
   private audioOn: boolean = false;
   private timerId: number = -1;
@@ -69,10 +74,22 @@ struct Index {
   private stallCount: number[] = [0, 0, 0, 0];
   private recovering: boolean = false;
 
+  /** 从设置页返回:刷新认证状态展示(凭证可能已改)。 */
+  onPageShow(): void {
+    const st = loadSettings(getAbilityContext()!);
+    this.authEnabled = st.authEnabled;
+    this.authUser = st.authUser;
+    this.authPass = st.authPass;
+  }
+
   aboutToAppear(): void {
     const st = loadSettings(getAbilityContext()!);
     this.curRotate = st.rotate;
     this.curResolution = st.resolution;
+    this.authEnabled = st.authEnabled;
+    this.authUser = st.authUser;
+    this.authPass = st.authPass;
+    AuthConfig.configure(st.authEnabled, st.authUser, st.authPass);
     const crash = CrashGuard.consume(getAbilityContext()!);
     if (crash !== null) {
       this.crashText = crash.split('\n').slice(0, 2).join('\n');
@@ -88,6 +105,16 @@ struct Index {
     }
   }
 
+  /** 持久化主页面维护的字段;认证字段由设置页独立写入,load-modify-save 防覆盖。 */
+  private persist(autoStart: boolean): void {
+    const s: Settings = loadSettings(getAbilityContext()!);
+    s.rotate = this.curRotate;
+    s.cam = -1;
+    s.autoStart = autoStart;
+    s.resolution = this.curResolution;
+    saveSettings(getAbilityContext()!, s);
+  }
+
   /**
    * 方向切换:该系统 HCODEC 不支持进程内二次配置编码器
    * (第二实例 need-input 永不回调,实测),因此:保存配置 → 退出应用,
@@ -98,12 +125,7 @@ struct Index {
       return;
     }
     try {
-      saveSettings(getAbilityContext()!, {
-        rotate: deg,
-        cam: -1,
-        autoStart: true,
-        resolution: this.curResolution
-      });
+      this.persist(true);
       await getAbilityContext()!.terminateSelf();
     } catch (e) {
       const msg = e instanceof Error ? e.message : JSON.stringify(e);
@@ -137,12 +159,7 @@ struct Index {
       return;
     }
     try {
-      saveSettings(getAbilityContext()!, {
-        rotate: this.curRotate,
-        cam: -1,
-        autoStart: true,
-        resolution: res
-      });
+      this.persist(true);
       await getAbilityContext()!.terminateSelf();
     } catch (e) {
       const msg = e instanceof Error ? e.message : JSON.stringify(e);
@@ -182,7 +199,7 @@ struct Index {
         throw new Error('no camera available');
       }
 
-      /* 服务器先行:拉流端可立即连接 */
+      /* 服务器先行:拉流端可立即连接(认证凭证已在启动/设置保存时注入) */
       this.status = '启动 RTSP / ONVIF / HTTP';
       await RtspServer.start(WANT_FPS);
       await OnvifServer.start(getAbilityContext()!);
@@ -241,12 +258,7 @@ struct Index {
       this.httpUrl = ip !== '' ? `http://${ip}:8090/ (快照/网页)` : '';
       this.running = true;
       this.status = '推流中';
-      saveSettings(getAbilityContext()!, {
-        rotate: this.curRotate,
-        cam: -1,
-        autoStart: false,
-        resolution: this.curResolution
-      });
+      this.persist(false);
       this.timerId = setInterval(() => {
         const parts = this.camInfos.map((c) => `${c.label}=${FrameHub.fps(c.index)}fps`);
         this.stats = `${parts.join(' ')} RTSP客户端=${RtspServer.sessionCount()}`;
@@ -414,11 +426,22 @@ struct Index {
 
   build() {
     Column({ space: 14 }) {
-      Text('手机IP摄像头')
-        .fontSize(24)
-        .fontWeight(FontWeight.Bold)
-        .fontColor('#E6E6E6')
-        .margin({ top: 36 })
+      Row() {
+        Text('手机IP摄像头')
+          .fontSize(24)
+          .fontWeight(FontWeight.Bold)
+          .fontColor('#E6E6E6')
+        Blank()
+        Text('⚙')
+          .fontSize(26)
+          .fontColor('#7EB8FF')
+          .onClick(() => {
+            router.pushUrl({ url: 'pages/Settings' });
+          })
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+      .margin({ top: 36 })
 
       Column({ space: 6 }) {
         Text(`状态: ${this.status}`).fontSize(14).fontColor('#E6E6E6')
@@ -428,6 +451,8 @@ struct Index {
         if (this.running) {
           Text(`音频: ${this.audioOn ? this.audioText : '关'}`)
             .fontSize(13).fontColor(this.audioOn ? '#9FD8A0' : '#888888')
+          Text(`认证: ${this.authEnabled ? `开启(${this.authUser})` : '关'}`)
+            .fontSize(13).fontColor(this.authEnabled ? '#9FD8A0' : '#888888')
         }
         if (this.stats !== '') {
           Text(this.stats).fontSize(13).fontColor('#E6E6E6')

@@ -3,6 +3,7 @@ import hilog from '@ohos.hilog';
 import { RtpPacketizer, splitAnnexB } from './RtpPacketizer';
 import { RtspServer, cameraOfUrl } from './RtspServer';
 import { CamRegistry } from '../net/CamRegistry';
+import { AuthConfig, AUTH_REALM, randomNonce, verifyRtspAuthorization } from '../auth/Auth';
 import { speakerWritePCMA } from 'libh264enc.so';
 
 const DOMAIN = 0x0806;
@@ -53,6 +54,7 @@ export class RtspSession {
   private epoch: number = 0;
   private lastTs: number = -1;
   private sendChain: Promise<void> = Promise.resolve();
+  private authNonce: string = '';
 
   constructor(conn: socket.TCPSocketConnection, fps: number) {
     this.conn = conn;
@@ -166,13 +168,30 @@ export class RtspSession {
     const method = reqLine[0];
     const url = reqLine[1];
     let cseq = '0';
+    let authorization = '';
     for (let i = 1; i < lines.length; i++) {
       const kv = lines[i].split(':');
       if (kv.length >= 2 && kv[0].trim().toLowerCase() === 'cseq') {
         cseq = kv[1].trim();
       }
+      if (kv.length >= 2 && kv[0].trim().toLowerCase() === 'authorization') {
+        /* 值内可能再含冒号(Digest 参数),去掉键名后取整行 */
+        authorization = lines[i].substring(lines[i].indexOf(':') + 1).trim();
+      }
     }
     hilog.info(DOMAIN, TAG, '%{public}s %{public}s', method, url);
+    /* 认证门禁:OPTIONS 放行(客户端探测能力),其余方法必须携带
+     * 有效 Basic/Digest 凭证;Digest nonce 按连接签发,过期即重挑战 */
+    if (AuthConfig.isEnabled() && method !== 'OPTIONS') {
+      if (!verifyRtspAuthorization(method, authorization, this.authNonce)) {
+        this.authNonce = randomNonce();
+        hilog.info(DOMAIN, TAG, '401 challenge for %{public}s', method);
+        this.send(`RTSP/1.0 401 Unauthorized\r\nCSeq: ${cseq}\r\n` +
+          `WWW-Authenticate: Digest realm="${AUTH_REALM}", nonce="${this.authNonce}", algorithm=MD5\r\n` +
+          `WWW-Authenticate: Basic realm="${AUTH_REALM}"\r\n\r\n`);
+        return;
+      }
+    }
     switch (method) {
       case 'OPTIONS':
         this.send(`RTSP/1.0 200 OK\r\nCSeq: ${cseq}\r\nPublic: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN\r\n\r\n`);
