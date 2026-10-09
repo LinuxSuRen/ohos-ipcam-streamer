@@ -11,6 +11,7 @@ import { OnvifServer } from '../onvif/OnvifServer';
 import { BackgroundKeeper } from '../background/BackgroundKeeper';
 import { CrashGuard } from '../entryability/CrashGuard';
 import { getAbilityContext, isCameraGranted, isMicGranted, isAppForeground } from '../entryability/GlobalContext';
+import router from '@ohos.router';
 import { loadSettings, saveSettings, Settings } from '../entryability/PersistStore';
 import { AuthConfig } from '../auth/Auth';
 import { refreshLanAddress } from '../net/NetUtil';
@@ -73,6 +74,14 @@ struct Index {
   private stallCount: number[] = [0, 0, 0, 0];
   private recovering: boolean = false;
 
+  /** 从设置页返回:刷新认证状态展示(凭证可能已改)。 */
+  onPageShow(): void {
+    const st = loadSettings(getAbilityContext()!);
+    this.authEnabled = st.authEnabled;
+    this.authUser = st.authUser;
+    this.authPass = st.authPass;
+  }
+
   aboutToAppear(): void {
     const st = loadSettings(getAbilityContext()!);
     this.curRotate = st.rotate;
@@ -80,6 +89,7 @@ struct Index {
     this.authEnabled = st.authEnabled;
     this.authUser = st.authUser;
     this.authPass = st.authPass;
+    AuthConfig.configure(st.authEnabled, st.authUser, st.authPass);
     const crash = CrashGuard.consume(getAbilityContext()!);
     if (crash !== null) {
       this.crashText = crash.split('\n').slice(0, 2).join('\n');
@@ -95,17 +105,13 @@ struct Index {
     }
   }
 
-  /** 统一持久化入口:认证字段随所有保存路径一起落盘,避免遗漏。 */
+  /** 持久化主页面维护的字段;认证字段由设置页独立写入,load-modify-save 防覆盖。 */
   private persist(autoStart: boolean): void {
-    const s: Settings = {
-      rotate: this.curRotate,
-      cam: -1,
-      autoStart: autoStart,
-      resolution: this.curResolution,
-      authEnabled: this.authEnabled,
-      authUser: this.authUser,
-      authPass: this.authPass
-    };
+    const s: Settings = loadSettings(getAbilityContext()!);
+    s.rotate = this.curRotate;
+    s.cam = -1;
+    s.autoStart = autoStart;
+    s.resolution = this.curResolution;
     saveSettings(getAbilityContext()!, s);
   }
 
@@ -193,9 +199,8 @@ struct Index {
         throw new Error('no camera available');
       }
 
-      /* 服务器先行:拉流端可立即连接;认证凭证注入三服务 */
+      /* 服务器先行:拉流端可立即连接(认证凭证已在启动/设置保存时注入) */
       this.status = '启动 RTSP / ONVIF / HTTP';
-      AuthConfig.configure(this.authEnabled, this.authUser, this.authPass);
       await RtspServer.start(WANT_FPS);
       await OnvifServer.start(getAbilityContext()!);
       await HttpServer.start();
@@ -421,11 +426,22 @@ struct Index {
 
   build() {
     Column({ space: 14 }) {
-      Text('手机IP摄像头')
-        .fontSize(24)
-        .fontWeight(FontWeight.Bold)
-        .fontColor('#E6E6E6')
-        .margin({ top: 36 })
+      Row() {
+        Text('手机IP摄像头')
+          .fontSize(24)
+          .fontWeight(FontWeight.Bold)
+          .fontColor('#E6E6E6')
+        Blank()
+        Text('⚙')
+          .fontSize(26)
+          .fontColor('#7EB8FF')
+          .onClick(() => {
+            router.pushUrl({ url: 'pages/Settings' });
+          })
+      }
+      .width('100%')
+      .alignItems(VerticalAlign.Center)
+      .margin({ top: 36 })
 
       Column({ space: 6 }) {
         Text(`状态: ${this.status}`).fontSize(14).fontColor('#E6E6E6')
@@ -487,37 +503,6 @@ struct Index {
           }, (res: string) => res)
         }
         .width('100%')
-      }
-
-      if (!this.running) {
-        Column({ space: 8 }) {
-          Row({ space: 10 }) {
-            Toggle({ type: ToggleType.Switch, isOn: this.authEnabled })
-              .onChange((on: boolean) => {
-                this.authEnabled = on;
-              })
-            Text('访问认证(RTSP/HTTP/ONVIF 共用一账号)')
-              .fontSize(14).fontColor('#E6E6E6')
-          }
-          if (this.authEnabled) {
-            TextInput({ placeholder: '用户名', text: this.authUser })
-              .fontSize(14)
-              .onChange((v: string) => {
-                this.authUser = v;
-              })
-            TextInput({ placeholder: '密码', text: this.authPass })
-              .type(InputType.Password)
-              .fontSize(14)
-              .onChange((v: string) => {
-                this.authPass = v;
-              })
-            Text('拉流地址形如 rtsp://用户名:密码@手机IP:8554/cam0;口令仅存本机沙箱')
-              .fontSize(12).fontColor('#888888')
-          }
-        }
-        .alignItems(HorizontalAlign.Start)
-        .width('100%')
-        .padding(12)
       }
 
       Row({ space: 16 }) {

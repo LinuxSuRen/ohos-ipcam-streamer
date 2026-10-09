@@ -300,8 +300,13 @@ export function verifyWsUsernameToken(envelope: string): boolean {
     try {
       const expect = b64Encode(sha1(concat3(b64Decode(nonce), utf8Bytes(created),
         utf8Bytes(AuthConfig.getPass()))));
+      if (expect !== passElem) {
+        hilog.warn(DOMAIN, TAG, 'digest mismatch: expect=%{public}s got=%{public}s nonceB64Len=%{public}d created=%{public}s',
+          expect, passElem, nonce.length, created);
+      }
       return expect === passElem;
     } catch (e) {
+      hilog.warn(DOMAIN, TAG, 'digest compute failed: %{public}s', JSON.stringify(e));
       return false;
     }
   }
