@@ -57,6 +57,7 @@ struct Index {
   @State profileText: string = '';
   @State rtspUrl: string = '';
   @State httpUrl: string = '';
+  @State onvifUrl: string = '';
   @State suggestDeg: number = -1;
   @State crashText: string = '';
   @State audioText: string = '';
@@ -256,6 +257,7 @@ struct Index {
       const ip = await refreshLanAddress();
       this.rtspUrl = ip !== '' ? `rtsp://${ip}:8554/cam0 … cam${this.camInfos.length - 1}` : 'rtsp://<本机IP>:8554/camN';
       this.httpUrl = ip !== '' ? `http://${ip}:8090/ (快照/网页)` : '';
+      this.onvifUrl = ip !== '' ? `http://${ip}:8000/onvif/device_service (ONVIF/NVR 接入)` : '';
       this.running = true;
       this.status = '推流中';
       this.persist(false);
@@ -462,6 +464,9 @@ struct Index {
         }
         if (this.httpUrl !== '') {
           Text(this.httpUrl).fontSize(13).fontColor('#7EB8FF')
+        }
+        if (this.onvifUrl !== '') {
+          Text(this.onvifUrl).fontSize(13).fontColor('#7EB8FF')
         }
         if (this.crashText !== '') {
           Text(`上次异常:\n${this.crashText}`).fontSize(12).fontColor('#FF6B6B')
