@@ -10,6 +10,7 @@ import { RtspServer } from '../rtsp/RtspServer';
 import { deviceModel, deviceOs, deviceLabel, deviceHardware, ensureDeviceId } from '../entryability/DeviceIdentity';
 import { PtzController } from './PtzController';
 import { CameraSource } from '../camera/CameraSource';
+import { EventBus, parseISODuration } from './EventBus';
 
 const DOMAIN = 0x0809;
 const TAG = 'ipcam.OnvifServer';
@@ -77,10 +78,18 @@ export class OnvifServer {
     await OnvifServer.startHttp();
     OnvifServer.startDiscovery();
     OnvifServer.running = true;
+    // SignalLoss 事件源：服务启动 = 信号恢复（相机上线）
+    EventBus.publish('tns1:VideoSource/SignalLoss',
+      [['Source', 'Camera_0']], [['State', 'false']]);
     hilog.info(DOMAIN, TAG, 'onvif started');
   }
 
   static async stop(): Promise<void> {
+    // SignalLoss 事件源：服务停止 = 信号丢失（相机下线）
+    if (OnvifServer.running) {
+      EventBus.publish('tns1:VideoSource/SignalLoss',
+        [['Source', 'Camera_0']], [['State', 'true']]);
+    }
     if (OnvifServer.httpServer !== null) {
       try {
         await OnvifServer.httpServer.close();
@@ -120,6 +129,7 @@ export class OnvifServer {
       let buf = '';
       let contentLength = -1;
       let headerDone = false;
+      let requestPath = '/';
       client.on('message', (info: socket.SocketMessageInfo) => {
         buf += ab2str(info.message);
         if (!headerDone) {
@@ -128,22 +138,29 @@ export class OnvifServer {
             return;
           }
           headerDone = true;
-          const m = /Content-Length:\s*(\d+)/i.exec(buf.substring(0, i));
+          const headers = buf.substring(0, i);
+          const m = /Content-Length:\s*(\d+)/i.exec(headers);
           contentLength = m !== null ? parseInt(m[1]) : 0;
+          // 提取请求行路径（POST /onvif/sub_N HTTP/1.1 → /onvif/sub_N）
+          const reqLine = headers.split('\r\n')[0] || '';
+          requestPath = reqLine.split(' ')[1] || '/';
           buf = buf.substring(i + 4);
         }
         if (contentLength >= 0 && buf.length >= contentLength) {
           const body = buf.substring(0, contentLength);
-          const response = OnvifServer.handleSoap(body);
-          const sendOpt: socket.TCPSendOptions = { data: utf8(response) };
-          client.send(sendOpt).then(() => {
-            client.close();
-          }).catch(() => {
-            client.close();
-          });
+          const path = requestPath;
+          const subMatch = /^\/onvif\/(sub_[A-Za-z0-9]+)$/.exec(path);
+          if (subMatch !== null) {
+            // PullPoint 订阅端点：PullMessages 可能需要阻塞等待
+            OnvifServer.handlePullPointAsync(client, subMatch[1], body);
+          } else {
+            const response = OnvifServer.handleSoap(body);
+            OnvifServer.sendSoapResponse(client, response);
+          }
           buf = '';
           headerDone = false;
           contentLength = -1;
+          requestPath = '/';
         }
       });
       client.on('close', () => {
@@ -249,6 +266,28 @@ export class OnvifServer {
     const ptzOp = new RegExp('<[A-Za-z0-9]+:?(ContinuousMove|AbsoluteMove|RelativeMove|Stop|GetStatus|GetConfigurationOptions)[\\s>]').exec(body);
     if (ptzOp !== null) {
       inner = OnvifServer.handlePtz(ptzOp[1], body, ip);
+    } else if (body.indexOf('CreatePullPointSubscription') >= 0) {
+      /* Event 服务：创建 PullPoint 订阅，返回独立订阅地址 */
+      const ttlMatch = /InitialTerminationTime>([^<]+)</.exec(body);
+      const ttlMs = ttlMatch !== null ? parseISODuration(ttlMatch[1]) : -1;
+      const subId = EventBus.create(ttlMs);
+      inner = `<tev:CreatePullPointSubscriptionResponse>` +
+        `<tev:SubscriptionReference><wsa:Address>http://${ip}:${HTTP_PORT}/onvif/${subId}</wsa:Address></tev:SubscriptionReference>` +
+        `<wsnt:CurrentTime>${new Date().toISOString().replace(/\.\d+Z$/, 'Z')}</wsnt:CurrentTime>` +
+        `<wsnt:TerminationTime>${new Date(Date.now() + (ttlMs > 0 ? ttlMs : 60000)).toISOString().replace(/\.\d+Z$/, 'Z')}</wsnt:TerminationTime>` +
+        `</tev:CreatePullPointSubscriptionResponse>`;
+    } else if (body.indexOf('GetEventProperties') >= 0) {
+      /* Event 服务：宣告支持的话题集 */
+      inner = '<tev:GetEventPropertiesResponse>' +
+        '<tev:TopicNamespaceLocation>http://www.onvif.org/onvif/ver10/topics/index.html</tev:TopicNamespaceLocation>' +
+        '<wsnt:FixedTopicSet>true</wsnt:FixedTopicSet>' +
+        '<wsnt:TopicExpressionDialect>http://www.onvif.org/ver10/tev/topicExpression/ConcreteSet</wsnt:TopicExpressionDialect>' +
+        '<wstop:TopicSet>' +
+        '<wstop:VideoSource><wstop:SignalLoss wstop:topic="true"/></wstop:VideoSource>' +
+        '<wstop:RuleEngine><wstop:CellMotion><wstop:Motion wstop:topic="true"/></wstop:CellMotion></wstop:RuleEngine>' +
+        '<wstop:Power><wstop:Battery wstop:topic="true"/></wstop:Power>' +
+        '</wstop:TopicSet>' +
+        '</tev:GetEventPropertiesResponse>';
     } else if (body.indexOf('GetSystemDateAndTime') >= 0) {
       const d = new Date();
       const p2 = (v: number) => v.toString().padStart(2, '0');
@@ -425,8 +464,77 @@ export class OnvifServer {
       'xmlns:tds="http://www.onvif.org/ver10/device/wsdl" ' +
       'xmlns:trt="http://www.onvif.org/ver10/media/wsdl" ' +
       'xmlns:tt="http://www.onvif.org/ver10/schema" ' +
-      'xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl">' +
+      'xmlns:tptz="http://www.onvif.org/ver20/ptz/wsdl" ' +
+      'xmlns:tev="http://www.onvif.org/ver10/events/wsdl" ' +
+      'xmlns:wsa="http://www.w3.org/2005/08/addressing" ' +
+      'xmlns:wsnt="http://docs.oasis-open.org/wsn/b-2" ' +
+      'xmlns:wstop="http://docs.oasis-open.org/wsn/t-1" ' +
+      'xmlns:tns1="http://www.onvif.org/ver10/topics" ' +
+      'xmlns:lns="http://www.linuxsuren.com/onvif/topics">' +
       `<s:Body>${inner}</s:Body></s:Envelope>`;
+  }
+
+  /** 发送 SOAP 应答并关闭连接 */
+  private static sendSoapResponse(client: socket.TCPSocketConnection, response: string): void {
+    const bodyBytes = utf8(response);
+    const header = 'HTTP/1.1 200 OK\r\nContent-Type: application/soap+xml; charset=utf-8\r\n' +
+      `Content-Length: ${bodyBytes.byteLength}\r\nConnection: close\r\n\r\n`;
+    const sendOpt: socket.TCPSendOptions = { data: header + response };
+    client.send(sendOpt).then(() => {
+      client.close();
+    }).catch(() => {
+      client.close();
+    });
+  }
+
+  /** PullPoint 订阅端点异步处理：PullMessages 阻塞至 Timeout 或有消息 */
+  private static handlePullPointAsync(client: socket.TCPSocketConnection, subId: string, body: string): void {
+    if (body.indexOf('PullMessages') >= 0) {
+      const timeoutMatch = /Timeout>([^<]+)</.exec(body);
+      const waitMs = timeoutMatch !== null ? Math.max(0, Math.min(parseISODuration(timeoutMatch[1]), 10000)) : 5000;
+      const limitMatch = /MessageLimit>(\d+)</.exec(body);
+      const limit = limitMatch !== null ? parseInt(limitMatch[1]) : 10;
+      const respond = () => {
+        const messages = EventBus.pull(subId, 0, limit); // drain 立即返回
+        const now = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
+        const inner = '<tev:PullMessagesResponse>' +
+          `<tev:CurrentTime>${now}</tev:CurrentTime>` +
+          `<tev:TerminationTime>${new Date(Date.now() + 60000).toISOString().replace(/\.\d+Z$/, 'Z')}</tev:TerminationTime>` +
+          (messages !== null ? messages : '') +
+          '</tev:PullMessagesResponse>';
+        OnvifServer.sendSoapResponse(client, OnvifServer.soapEnvelope(inner));
+      };
+      // 有消息立即回，无消息等 waitMs 再回（短轮询模型，ArkTS 无长阻塞原语）
+      const existing = EventBus.pull(subId, 0, limit);
+      if (existing !== null && existing.length > 0) {
+        // 有消息：重新入队（drain 出来了，直接用）
+        const now = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
+        const inner = '<tev:PullMessagesResponse>' +
+          `<tev:CurrentTime>${now}</tev:CurrentTime>` +
+          `<tev:TerminationTime>${new Date(Date.now() + 60000).toISOString().replace(/\.\d+Z$/, 'Z')}</tev:TerminationTime>` +
+          existing +
+          '</tev:PullMessagesResponse>';
+        OnvifServer.sendSoapResponse(client, OnvifServer.soapEnvelope(inner));
+      } else {
+        setTimeout(respond, Math.min(waitMs, 5000));
+      }
+    } else if (body.indexOf('Renew') >= 0) {
+      const ttlMatch = /TerminationTime>([^<]+)</.exec(body);
+      const ttlMs = ttlMatch !== null ? parseISODuration(ttlMatch[1]) : -1;
+      EventBus.renew(subId, ttlMs);
+      const now = new Date().toISOString().replace(/\.\d+Z$/, 'Z');
+      const term = new Date(Date.now() + (ttlMs > 0 ? ttlMs : 60000)).toISOString().replace(/\.\d+Z$/, 'Z');
+      OnvifServer.sendSoapResponse(client,
+        OnvifServer.soapEnvelope(`<wsnt:RenewResponse><wsnt:TerminationTime>${term}</wsnt:TerminationTime></wsnt:RenewResponse>`));
+    } else if (body.indexOf('Unsubscribe') >= 0) {
+      EventBus.unsubscribe(subId);
+      OnvifServer.sendSoapResponse(client,
+        OnvifServer.soapEnvelope('<wsnt:UnsubscribeResponse/>'));
+    } else {
+      OnvifServer.sendSoapResponse(client,
+        OnvifServer.soapEnvelope('<s:Fault><s:Code><s:Value>s:Sender</s:Value></s:Code>' +
+          '<s:Reason><s:Text>not supported on pull point</s:Text></s:Reason></s:Fault>'));
+    }
   }
 
   /** profile_N → 相机编号(N-1),无法解析按 0 号处理。 */

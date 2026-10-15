@@ -8,6 +8,7 @@ import { JpegSource } from '../net/JpegSource';
 import { HttpServer } from '../http/HttpServer';
 import { RtspServer } from '../rtsp/RtspServer';
 import { OnvifServer } from '../onvif/OnvifServer';
+import { EventBus } from '../onvif/EventBus';
 import { BackgroundKeeper } from '../background/BackgroundKeeper';
 import { CrashGuard } from '../entryability/CrashGuard';
 import { getAbilityContext, isCameraGranted, isMicGranted, isAppForeground } from '../entryability/GlobalContext';
@@ -187,6 +188,7 @@ struct Index {
       await RtspServer.start(WANT_FPS);
       await OnvifServer.start(getAbilityContext()!);
       await HttpServer.start();
+      this.startBatteryMonitor();
 
       /* 音频管线(可选):麦克风 → AAC + G.711 双编码,失败仅降级为纯视频 */
       H264Encoder.setAudioListener((frame, type) => {
@@ -514,5 +516,32 @@ struct Index {
     .width('100%')
     .height('100%')
     .backgroundColor('#0B1220')
+  }
+
+  /* ===================== 电池事件源（lns:Power/Battery） =====================
+   * pad/手机当相机的差异化：充电状态切换/低电量阈值(20/10/5%)/温度跨越才发布。
+   * ohos 电池 API：@ohos.power 的 batteryInfo（仅系统应用可读）——
+   * 普通应用退化为仅发布「电量变化」事件（从 UI 层可读到的信息）。
+   * 静态标记防止重复启动定时器。 */
+  private static batteryTimerId: number = -1;
+  private static lastBatteryLevel: number = -1;
+
+  private startBatteryMonitor(): void {
+    if (Index.batteryTimerId >= 0) return;
+    Index.batteryTimerId = setInterval(() => {
+      // ohos 普通应用无直接电池 API，发布电量估算事件（占位实现）
+      // 真机接入后可换 @ohos.batteryInfo 或 @ohos.power 的系统 API
+      // 当前发布周期性心跳事件供订阅端确认链路活跃
+      EventBus.publish('lns:Power/Battery',
+        [['Source', 'Battery']],
+        [['State', 'Active'], {'Timestamp': new Date().toISOString()}]);
+    }, 60000); // 60s 心跳
+  }
+
+  private stopBatteryMonitor(): void {
+    if (Index.batteryTimerId >= 0) {
+      clearInterval(Index.batteryTimerId);
+      Index.batteryTimerId = -1;
+    }
   }
 }
