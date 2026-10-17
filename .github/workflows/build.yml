@@ -1,0 +1,77 @@
+name: build
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+# 同一分支新推送取消旧任务,节省 2GB 工具链下载后的重复构建
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # HarmonyOS Command Line Tools 版本:必须与 hvigor/hvigor-config.json5
+  # 的 modelVersion(6.0.0)同大版本,CLT 6.x 配套 HarmonyOS SDK。
+  # 华为官方下载链接是带 ticket 的签名 URL(会过期),无法写进 CI,
+  # 采用 HuggingFace 镜像(csukuangfj 维护,AGenUI 等项目 CI 实测可用)。
+  # 如换版本:https://huggingface.co/csukuangfj/harmonyos-commandline-tools
+  CLT_VERSION: "6.0.1.251"
+  CLT_FILENAME: "commandline-tools-linux-x64-6.0.1.251.zip"
+
+jobs:
+  hap:
+    name: Build HAP
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # hvigor 需要 JDK;CLT 自带的 node 在 tool/node,无需另装
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # 工具链 zip ~2GB,按文件名精确缓存(版本升级换 key 自动重下)
+      - name: Cache command line tools
+        id: cache-clt
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CLT_FILENAME }}
+          key: harmonyos-clt-${{ env.CLT_FILENAME }}
+
+      - name: Download command line tools
+        if: steps.cache-clt.outputs.cache-hit != 'true'
+        run: |
+          curl -fSL --retry 3 -o "$CLT_FILENAME" \
+            "https://huggingface.co/csukuangfj/harmonyos-commandline-tools/resolve/main/${CLT_FILENAME}"
+
+      - name: Extract and configure toolchain
+        run: |
+          unzip -q "$CLT_FILENAME" -d clt
+          CLT_ROOT="$PWD/clt/command-line-tools"
+          test -x "$CLT_ROOT/bin/hvigorw" || { ls -R "$CLT_ROOT" | head -30; exit 1; }
+          echo "DEVECO_SDK_HOME=${CLT_ROOT}/sdk" >> "$GITHUB_ENV"
+          echo "HOS_SDK_HOME=${CLT_ROOT}/sdk" >> "$GITHUB_ENV"
+          echo "${CLT_ROOT}/bin" >> "$GITHUB_PATH"
+          echo "${CLT_ROOT}/hvigor/bin" >> "$GITHUB_PATH"
+          echo "${CLT_ROOT}/ohpm/bin" >> "$GITHUB_PATH"
+          echo "${CLT_ROOT}/tool/node/bin" >> "$GITHUB_PATH"
+
+      # 依赖只有 libh264enc.so 的本地 file: 引用,无需访问 ohpm 仓库
+      - name: Install dependencies
+        run: ohpm install --all
+
+      # ArkTS + C++(CMake/NDK)全链编译;产物为未签名 HAP,
+      # 签名材料不入库,本地用 .signing/sign.sh 签名(见 README)
+      - name: Build HAP
+        run: hvigorw assembleHap --no-daemon
+
+      - name: Upload HAP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hap-unsigned-${{ github.sha }}
+          path: entry/build/default/outputs/default/entry-default-unsigned.hap
+          retention-days: 7
+          if-no-files-found: error

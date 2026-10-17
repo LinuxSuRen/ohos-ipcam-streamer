@@ -10,9 +10,15 @@ export interface Settings {
   cam: number;
   autoStart: boolean;
   resolution: string; /* "宽x高",如 1280x720 */
+  authEnabled: boolean; /* RTSP/HTTP/ONVIF 认证总开关 */
+  authUser: string;
+  authPass: string; /* 明文存应用沙箱:Digest 服务端校验需明文参与哈希 */
 }
 
-const DEFAULTS: Settings = { rotate: 0, cam: -1, autoStart: false, resolution: '1280x720' };
+const DEFAULTS: Settings = {
+  rotate: 0, cam: -1, autoStart: false, resolution: '1280x720',
+  authEnabled: false, authUser: '', authPass: ''
+};
 
 function path(context: common.Context): string {
   return `${context.filesDir}/${FILE}`;
@@ -25,6 +31,16 @@ export function loadSettings(context: common.Context): Settings {
     if (obj.rotate !== undefined && obj.rotate >= 0) {
       if (obj.resolution === undefined || obj.resolution === '') {
         obj.resolution = DEFAULTS.resolution;
+      }
+      /* 旧版本配置无认证字段:补默认值,升级零破坏 */
+      if (obj.authEnabled === undefined) {
+        obj.authEnabled = DEFAULTS.authEnabled;
+      }
+      if (obj.authUser === undefined) {
+        obj.authUser = DEFAULTS.authUser;
+      }
+      if (obj.authPass === undefined) {
+        obj.authPass = DEFAULTS.authPass;
       }
       return obj;
     }
